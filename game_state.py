@@ -41,6 +41,7 @@ class MafiaGame:
             'mafia_misfire': False,
             'perks_messages': [],
             'night_resolved': False,
+            'nominations_done': False,
             'final_voting_done': False,
             'discussion_started': False,
             'special_event': special_event,
@@ -150,7 +151,7 @@ class MafiaGame:
         all_players = self.get_all_players(chat_id)
         players = list(all_players.keys())
         player_count = len(players)
-        
+
         if player_count < 5:
             return False
         
@@ -164,16 +165,38 @@ class MafiaGame:
         while len(roles_to_assign) < player_count:
             roles_to_assign.append('demyan')
         
-        random.shuffle(players)
-        random.shuffle(roles_to_assign)
-        
-        # Присвоюємо ролі
-        for player_id, role in zip(players, roles_to_assign):
+        roles_pool = roles_to_assign.copy()
+
+        human_ids = list(game['players'].keys())
+        bot_ids = list(game['bots'].keys())
+        random.shuffle(human_ids)
+        random.shuffle(bot_ids)
+
+        assignments = {}
+
+        # Детектив завжди дістається живому гравцю, якщо такі є
+        if 'detective' in roles_pool and human_ids:
+            detective_owner = human_ids.pop()
+            assignments[detective_owner] = 'detective'
+            roles_pool.remove('detective')
+
+        # Решта ролей розподіляються випадково між усіма
+        remaining_players = human_ids + bot_ids
+        random.shuffle(remaining_players)
+
+        for role in roles_pool:
+            if not remaining_players:
+                break
+            player_id = remaining_players.pop()
+            assignments[player_id] = role
+
+        # Фінально зберігаємо ролі
+        for player_id, role in assignments.items():
             if player_id in game['players']:
                 game['players'][player_id]['role'] = role
             elif player_id in game['bots']:
                 game['bots'][player_id]['role'] = role
-        
+
         game['alive_players'] = set(players)
         game['started'] = True
         
@@ -183,7 +206,7 @@ class MafiaGame:
             for player_id in players:
                 if random.random() < event['item_chance']:
                     game['special_items'][player_id] = event['special_item']
-        
+
         return True
     
     def get_role_info(self, role_key: str) -> Dict:
@@ -241,5 +264,31 @@ class MafiaGame:
                     citizens.append((user_id, player_info))
         
         return citizens
+
+    def get_player_item(self, chat_id: int, user_id: int) -> Optional[str]:
+        """Повертає спеціальний предмет гравця (якщо є)"""
+        if chat_id not in self.games:
+            return None
+        return self.games[chat_id]['special_items'].get(user_id)
+
+    def use_potato(self, chat_id: int, thrower_id: int, target_id: int) -> bool:
+        """Фіксує кидок картоплі (одноразовий предмет)"""
+        if chat_id not in self.games:
+            return False
+
+        game = self.games[chat_id]
+        if game['special_items'].get(thrower_id) != 'potato':
+            return False
+
+        if thrower_id not in game['alive_players']:
+            return False
+
+        if target_id == thrower_id or target_id not in game['alive_players']:
+            return False
+
+        # Забираємо предмет та зберігаємо вибір
+        del game['special_items'][thrower_id]
+        game['potato_throws'][thrower_id] = target_id
+        return True
 
 mafia_game = MafiaGame()
