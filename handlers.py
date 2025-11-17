@@ -110,6 +110,11 @@ async def _notify_missing_scheduler(context: ContextTypes.DEFAULT_TYPE, chat_id:
     )
 
 
+
+# ============================================
+# ДОПОМІЖНІ ФУНКЦІЇ
+# ============================================
+
 def _merge_players(game: dict) -> dict:
     """Комбінує гравців та ботів у один словник"""
     combined = dict(game['players'])
@@ -359,11 +364,13 @@ async def process_bot_actions(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             target = random.choice(alive_targets)
 
             if mafia_game.use_potato(chat_id, bot_id, target):
+                bot_name = bot_info['username']
                 target_name = all_players[target]['username']
 
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=f"🤖🥔 Один із ботів кинув картоплю в <b>{target_name}</b>!",
+                    text=f"🤖🥔 <b>{bot_name}</b> кинув картоплю в <b>{target_name}</b>!",
                     parse_mode=ParseMode.HTML
                 )
 
@@ -1089,6 +1096,12 @@ async def night_phase(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         )
     else:
         await _notify_missing_scheduler(context, chat_id, game)
+    context.job_queue.run_once(
+        night_timeout,
+        when=night_duration,
+        chat_id=chat_id,
+        name=f"night_{chat_id}"
+    )
 
     # Розсилка дій живим гравцям
     for user_id, player_info in game['players'].items():
@@ -1410,6 +1423,7 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     check_results = []
     detective_shot: Optional[int] = None
     potato_results = []
+    potato_kills = []
     discussion_duration = TIMERS['discussion']
     potato_actions = dict(game.get('potato_throws', {}))
     game['potato_throws'] = {}
@@ -1430,6 +1444,19 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 'target_name': target['username'],
                 'hit': random.random() < 0.20
             })
+            thrower_name = thrower['username'] if thrower else "Гравець"
+            target_name = target['username']
+
+            if random.random() < 0.20:  # 20% влучити
+                potato_kills.append((thrower_id, target_id))
+                game['perks_messages'].append(
+                    f"🥔💥 <b>{random.choice(POTATO_PHRASES)}</b>\n"
+                    f"<b>{thrower_name}</b> влучив у <b>{target_name}</b>!"
+                )
+            else:
+                game['perks_messages'].append(
+                    f"🥔 <b>{thrower_name}</b> промахнувся по <b>{target_name}</b>!"
+                )
 
     # Розбір нічних дій
     for user_id, action_info in game['night_actions'].items():
@@ -1657,6 +1684,12 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         )
     else:
         await _notify_missing_scheduler(context, chat_id, game)
+    context.job_queue.run_once(
+        discussion_timeout,
+        when=discussion_duration,
+        chat_id=chat_id,
+        name=f"discussion_{chat_id}"
+    )
 
 
 async def discussion_timeout(context: ContextTypes.DEFAULT_TYPE):
