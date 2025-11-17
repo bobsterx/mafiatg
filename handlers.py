@@ -61,6 +61,18 @@ BOT_NIGHT_MESSAGES = [
 ]
 
 PERKS_DIVIDER = "━━━━━━━━━━━━━━"
+
+
+async def _announce_hidden_potato_throw(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, target_name: str
+) -> None:
+    """Надсилає нейтральне повідомлення про кидок картоплі без розкриття особи."""
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🥔 <i>Хтось кинув картоплю в <b>{target_name}</b>!</i>",
+        parse_mode=ParseMode.HTML,
+    )
 BOT_ACTION_MESSAGES = {
     'kill': [
         "🔫 Мафія зробила свій вибір...",
@@ -376,6 +388,9 @@ async def process_bot_actions(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             target = random.choice(alive_targets)
 
             if mafia_game.use_potato(chat_id, bot_id, target):
+                target_name = all_players[target]['username']
+                await _announce_hidden_potato_throw(
+                    context, chat_id, target_name
                 bot_name = bot_info['username']
                 target_name = all_players[target]['username']
 
