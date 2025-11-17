@@ -1,14 +1,32 @@
-"""Telegram handlers and game flow for the Mafia bot - Part 1."""
+"""Telegram handlers and game flow for the Mafia bot.
+
+Повний функціонал:
+- Реєстрація гравців та ботів
+- Нічна фаза з таймером (45 сек)
+- Денна фаза з обговоренням (60 сек)
+- Голосування за виключення
+- Логіка ботів (мафія/лікар/мирні)
+- Спеціальні події (Буковель + картопля)
+- GIF анімації
+- Перки (5% шанс)
+"""
 
 import os
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.ext import ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from telegram.constants import ParseMode
 from collections import defaultdict
 import asyncio
 import random
-from typing import Optional
+from typing import Optional, List, Tuple
 
 from config import (
     ROLES, DEATH_PHRASES, SAVED_PHRASES, MAFIA_PHRASES, 
@@ -26,6 +44,10 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+# ============================================
+# ДОПОМІЖНІ ФУНКЦІЇ
+# ============================================
+
 async def send_gif(context: ContextTypes.DEFAULT_TYPE, chat_id: int, gif_type: str, caption: str = None):
     """Відправка GIF файлу"""
     try:
@@ -38,7 +60,9 @@ async def send_gif(context: ContextTypes.DEFAULT_TYPE, chat_id: int, gif_type: s
                     caption=caption,
                     parse_mode=ParseMode.HTML
                 )
-        elif caption:
+                return
+        # Якщо GIF не знайдено, просто текст
+        if caption:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=caption,
@@ -69,15 +93,143 @@ async def check_dead_player_message(update: Update, context: ContextTypes.DEFAUL
                 await update.message.delete()
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text="💀 <b>ТИ МЕРТВИЙ!</b>\n\nНе можеш писати в чат до кінця гри.\n🤐 Дотримуйся правил!",
+                    text="💀 <b>ТИ МЕРТВИЙ!</b>\n\nНе можеш писати в чат до кінця гри.\n🤐 Дотримуйся правил, мертвяк!",
                     parse_mode=ParseMode.HTML
                 )
             except Exception as e:
-                logger.error(f"Помилка видалення повідомлення мертвого гравця: {e}")
+                logger.error(f"Помилка видалення повідомлення мертвого: {e}")
 
+
+# ============================================
+# ЛОГІКА БОТІВ
+# ============================================
+
+def bot_mafia_choice(game: dict, bot_id: int) -> Optional[int]:
+    """Мафія вибирає жертву випадково з мирних"""
+    citizens = [
+        uid for uid, pinfo in game['players'].items()
+        if pinfo['alive'] and mafia_game.get_role_info(pinfo['role'])['team'] == 'citizens'
+    ]
+    return random.choice(citizens) if citizens else None
+
+
+def bot_doctor_choice(game: dict, bot_id: int) -> Optional[int]:
+    """Лікар лікує випадково (не себе двічі поспіль)"""
+    targets = [
+        uid for uid, pinfo in game['players'].items()
+        if pinfo['alive'] and (uid != bot_id or game['last_healed'] != bot_id)
+    ]
+    return random.choice(targets) if targets else None
+
+
+def bot_voting_choice(game: dict, bot_id: int) -> int:
+    """Бот голосує за гравця з 2+ голосами або за випадкового"""
+    # Підраховуємо голоси
+    vote_counts = defaultdict(int)
+    for voted_for in game['votes'].values():
+        if voted_for != 0:
+            vote_counts[voted_for] += 1
+    
+    # Якщо є кандидат з 2+ голосами
+    candidates = [uid for uid, count in vote_counts.items() if count >= 2]
+    if candidates:
+        return random.choice(candidates)
+    
+    # Інакше випадковий живий гравець (крім себе)
+    alive = [
+        uid for uid, pinfo in game['players'].items()
+        if pinfo['alive'] and uid != bot_id
+    ]
+    return random.choice(alive) if alive else 0
+
+
+async def process_bot_actions(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Обробка дій ботів під час нічної фази"""
+    game = mafia_game.games[chat_id]
+    
+    for bot_id, bot_info in game['bots'].items():
+        if not bot_info['alive']:
+            continue
+        
+        role_key = bot_info['role']
+        role_info = mafia_game.get_role_info(role_key)
+        action = role_info.get('action')
+        
+        if not action:
+            continue
+        
+        target = None
+        if action == 'kill':
+            target = bot_mafia_choice(game, bot_id)
+        elif action == 'heal':
+            target = bot_doctor_choice(game, bot_id)
+        # Детектив ботам не випадає
+        
+        if target:
+            game['night_actions'][bot_id] = {
+                'action': action,
+                'target': target
+            }
+            
+            await asyncio.sleep(random.uniform(1, 3))  # Імітація "думання"
+            
+            bot_name = bot_info['username']
+            action_emoji = {'kill': '🔪', 'heal': '💉'}
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🤖 <b>{bot_name}</b> {action_emoji.get(action, '✅')} зробив свій вибір...",
+                parse_mode=ParseMode.HTML
+            )
+
+
+async def process_bot_votes(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Обробка голосів ботів за висунення кандидата"""
+    game = mafia_game.games[chat_id]
+    
+    for bot_id, bot_info in game['bots'].items():
+        if not bot_info['alive']:
+            continue
+        
+        await asyncio.sleep(random.uniform(1, 2))
+        
+        choice = bot_voting_choice(game, bot_id)
+        game['votes'][bot_id] = choice
+        
+        bot_name = bot_info['username']
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🤖 <b>{bot_name}</b> висунув кандидата!",
+            parse_mode=ParseMode.HTML
+        )
+
+
+async def process_bot_final_votes(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Боти голосують ЗА/ПРОТИ випадково"""
+    game = mafia_game.games[chat_id]
+    
+    for bot_id, bot_info in game['bots'].items():
+        if not bot_info['alive']:
+            continue
+        
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        
+        vote = random.choice(['yes', 'no'])
+        game['vote_results'][bot_id] = vote
+        
+        bot_name = bot_info['username']
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🤖 <b>{bot_name}</b> проголосував!",
+            parse_mode=ParseMode.HTML
+        )
+
+
+# ============================================
+# КОМАНДИ /start, /newgame, /status, /endgame
+# ============================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start - показує головне меню"""
+    """Команда /start"""
     if update.message and update.message.chat.type != 'private':
         await update.message.reply_text(
             "👋 <b>Вітаю в грі МАФІЯ!</b>\n\n"
@@ -86,7 +238,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "   /newgame - створити нову гру\n"
             "   /endgame - завершити поточну гру\n"
             "   /status - статус гри\n\n"
-            "💡 <b>Важливо:</b> Спочатку напишіть боту в особисті повідомлення /start!",
+            "💡 <b>Важливо:</b> Спочатку напишіть боту /start в особисті повідомлення!",
             parse_mode=ParseMode.HTML
         )
         return
@@ -116,9 +268,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 <b>🎲 Нові фічі:</b>
 - 🤖 Можна додати ботів (1-10)
-- 🥔 Спеціальні події (30% шанс)
-- 🔫 Детектив може вистрілити
-- 🎪 Рандомні перки (5% шанс)
+- 🥔 Спеціальні події (Буковель!)
+- 🔫 Детектив має кулю
+- 🎪 Рандомні перки (5%)
 
 Оберіть розділ нижче! 👇
 """
@@ -130,7 +282,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def newgame_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /newgame - створення гри в групі"""
+    """Команда /newgame"""
     if update.message.chat.type == 'private':
         await update.message.reply_text(
             "⚠️ Ця команда працює тільки в груповому чаті!",
@@ -150,7 +302,6 @@ async def newgame_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     game = mafia_game.create_game(chat_id, admin_id)
     
-    # Показуємо інформацію про спеціальну подію
     event_text = ""
     if game['special_event']:
         event_info = SPECIAL_EVENTS[game['special_event']]
@@ -172,7 +323,6 @@ async def newgame_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - Мінімум 5 учасників (гравці + боти)
 - Максимум 15 учасників
 - Можна додати ботів (1-10)
-- Гра триває до перемоги
 
 <b>👥 Гравці (0/15):</b>
 <i>Поки що немає...</i>
@@ -181,7 +331,7 @@ async def newgame_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 <b>⚠️ ВАЖЛИВО:</b> Напишіть /start боту в особисті повідомлення!
 
-👇 <b>ПРИЄДНУЙТЕСЬ ЗАРАЗ!</b> 👇
+👇 <b>ПРИЄДНУЙТЕСЬ!</b> 👇
 """
     
     msg = await update.message.reply_text(
@@ -192,20 +342,129 @@ async def newgame_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     mafia_game.game_messages[chat_id] = msg.message_id
 
-    """Telegram handlers - Part 2: Registration and Bots."""
 
-import random
-import asyncio
-import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes
-from telegram.constants import ParseMode
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /status"""
+    chat_id = update.message.chat_id
+    
+    if chat_id not in mafia_game.games:
+        await update.message.reply_text(
+            "⚠️ Активна гра не знайдена!\n\nСтворіть нову гру командою /newgame",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    game = mafia_game.games[chat_id]
+    
+    phase_names = {
+        'registration': '📝 Реєстрація',
+        'night': f'🌙 Ніч {game["day_number"]}',
+        'day': f'☀️ День {game["day_number"]}',
+        'discussion': f'🗣 Обговорення дня {game["day_number"]}',
+        'voting': f'🗳 Голосування дня {game["day_number"]}',
+        'ended': '🏁 Гра завершена'
+    }
+    
+    all_players = mafia_game.get_all_players(chat_id)
+    status_text = f"""
+📊 <b>━━━ СТАТУС ГРИ ━━━</b> 📊
 
-from game_state import mafia_game
-from config import SPECIAL_EVENTS
+<b>🎮 Фаза:</b> {phase_names.get(game['phase'], 'Невідомо')}
+<b>👥 Всього учасників:</b> {len(all_players)}
+<b>🤖 З них ботів:</b> {len(game['bots'])}
+"""
+    
+    if game['started']:
+        status_text += f"<b>💚 Живих:</b> {len(game['alive_players'])}\n"
+        status_text += f"<b>📅 День №:</b> {game['day_number']}\n"
+        status_text += f"<b>🔫 Куля детектива:</b> {'Використана' if game['detective_bullet_used'] else 'Є'}\n\n"
+        
+        status_text += "<b>👥 Учасники:</b>\n"
+        for i, (uid, pinfo) in enumerate(all_players.items(), 1):
+            status_emoji = "✅" if pinfo['alive'] else "💀"
+            bot_emoji = "🤖 " if pinfo['is_bot'] else ""
+            status_text += f"{i}. {status_emoji} {bot_emoji}{pinfo['username']}\n"
+    
+    await update.message.reply_text(status_text, parse_mode=ParseMode.HTML)
 
-logger = logging.getLogger(__name__)
 
+async def endgame_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /endgame"""
+    if update.message.chat.type == 'private':
+        await update.message.reply_text(
+            "⚠️ Ця команда працює тільки в груповому чаті!",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    chat_id = update.message.chat_id
+    user_id = update.message.from_user.id
+    
+    if chat_id not in mafia_game.games:
+        await update.message.reply_text(
+            "⚠️ Активна гра не знайдена!",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    try:
+        chat_member = await context.bot.get_chat_member(chat_id, user_id)
+        if chat_member.status not in ['creator', 'administrator']:
+            await update.message.reply_text(
+                "⚠️ Тільки адміністратори можуть завершити гру!",
+                parse_mode=ParseMode.HTML
+            )
+            return
+    except Exception:
+        pass
+    
+    del mafia_game.games[chat_id]
+    if chat_id in mafia_game.game_messages:
+        del mafia_game.game_messages[chat_id]
+    
+    await update.message.reply_text(
+        "🏁 <b>ГРУ ЗАВЕРШЕНО!</b>\n\nСтворіть нову гру командою /newgame 🎮",
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /help"""
+    help_text = """
+🎮 <b>━━━ КОМАНДИ БОТА ━━━</b> 🎮
+
+<b>📝 В ГРУПОВОМУ ЧАТІ:</b>
+/newgame - Створити нову гру
+/status - Статус гри
+/endgame - Завершити гру (адміни)
+
+<b>💬 В ОСОБИСТИХ ПОВІДОМЛЕННЯХ:</b>
+/start - Головне меню
+/help - Ця довідка
+
+<b>🎯 ЯК ПОЧАТИ:</b>
+1. Додайте бота в групу
+2. Напишіть /start боту в ЛС
+3. В групі /newgame
+4. Приєднуйтесь через кнопку
+5. Додайте ботів (опціонально)
+6. Адмін запускає гру
+
+<b>🎲 ФІЧІ:</b>
+- 🤖 Боти з логікою
+- 🥔 Буковель з картоплею
+- 🔫 Куля детектива
+- 🎪 Рандомні перки
+
+<b>🎭 Приємної гри!</b>
+"""
+    
+    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+
+
+# ============================================
+# РЕЄСТРАЦІЯ ГРАВЦІВ ТА БОТІВ
+# ============================================
 
 async def join_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Приєднання до гри"""
@@ -221,33 +480,28 @@ async def join_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     game = mafia_game.games[chat_id]
-    total_players = len(game['players']) + len(game['bots'])
+    all_players = mafia_game.get_all_players(chat_id)
     
-    if total_players >= 15:
-        await query.answer("⚠️ Гра повна! Максимум 15 гравців.", show_alert=True)
+    if len(all_players) >= 15:
+        await query.answer("⚠️ Гра повна! Максимум 15 учасників.", show_alert=True)
         return
     
     if mafia_game.add_player(chat_id, user_id, username):
-        player_count = len(game['players'])
-        
         try:
             welcome_msg = f"""
 ✅ <b>ВИ В ГРІ!</b> 🎉
 
 Вітаємо, <b>{username}</b>!
 
-Ви успішно приєдналися до гри МАФІЯ!
-
 🎮 <b>Що далі?</b>
-- Чекайте на початок гри
-- Отримаєте свою роль в особисті повідомлення
+- Чекайте на початок
+- Отримаєте роль в ЛС
 - Грайте та перемагайте!
 
-<b>👥 Гравців зараз:</b> {player_count}
+<b>👥 Гравців:</b> {len(game['players'])}
 <b>🤖 Ботів:</b> {len(game['bots'])}
-{'⏳ Потрібно ще ' + str(5 - total_players - 1) + ' учасників' if total_players + 1 < 5 else '✅ Можна починати!'}
 
-<i>Удачі в грі! 🍀</i>
+<i>Удачі! 🍀</i>
 """
             await context.bot.send_message(
                 chat_id=user_id,
@@ -258,8 +512,7 @@ async def join_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.error(f"Не можу надіслати повідомлення {user_id}: {e}")
             del game['players'][user_id]
             await query.answer(
-                "⚠️ Я не можу надіслати вам повідомлення!\n"
-                "Напишіть мені /start в особистих повідомленнях спочатку!",
+                "⚠️ Напишіть мені /start в ЛС спочатку!",
                 show_alert=True
             )
             return
@@ -278,22 +531,22 @@ async def add_bots_menu_callback(update: Update, context: ContextTypes.DEFAULT_T
     chat_id = query.message.chat_id
     
     if chat_id not in mafia_game.games:
-        await query.answer("⚠️ Створіть гру командою /newgame!", show_alert=True)
+        await query.answer("⚠️ Гра не знайдена!", show_alert=True)
         return
     
     game = mafia_game.games[chat_id]
-    total_players = len(game['players']) + len(game['bots'])
-    available_slots = 15 - total_players
+    all_players = mafia_game.get_all_players(chat_id)
+    available_slots = 15 - len(all_players)
     
     if available_slots <= 0:
-        await query.answer("⚠️ Гра повна! Не можна додати ботів.", show_alert=True)
+        await query.answer("⚠️ Гра повна!", show_alert=True)
         return
     
     keyboard = []
     for i in [1, 2, 3, 5, 10]:
         if i <= available_slots:
             keyboard.append([InlineKeyboardButton(
-                f"🤖 Додати {i} бот{'а' if i in [2, 3] else 'ів' if i > 3 else ''}",
+                f"🤖 Додати {i} бот{'а' if i in [2, 3, 4] else 'ів' if i > 4 else ''}",
                 callback_data=f"add_bots_{i}"
             )])
     
@@ -301,17 +554,17 @@ async def add_bots_menu_callback(update: Update, context: ContextTypes.DEFAULT_T
     
     await query.edit_message_text(
         f"🤖 <b>ДОДАТИ БОТІВ</b>\n\n"
-        f"👥 Зараз гравців: {len(game['players'])}\n"
-        f"🤖 Зараз ботів: {len(game['bots'])}\n"
-        f"📊 Вільних місць: {available_slots}\n\n"
-        f"<b>Скільки ботів додати?</b>",
+        f"👥 Гравців: {len(game['players'])}\n"
+        f"🤖 Ботів: {len(game['bots'])}\n"
+        f"📊 Вільно: {available_slots}\n\n"
+        f"<b>Скільки додати?</b>",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.HTML
     )
 
 
 async def add_bots_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Додавання ботів до гри"""
+    """Додавання ботів"""
     query = update.callback_query
     await query.answer()
     
@@ -326,7 +579,7 @@ async def add_bots_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     added = mafia_game.add_bots(chat_id, count)
     
     if added > 0:
-        await query.answer(f"✅ Додано {added} бот{'а' if added in [2, 3] else 'ів'}!", show_alert=True)
+        await query.answer(f"✅ Додано {added} бот{'а' if added in [2, 3, 4] else 'ів'}!", show_alert=True)
         await update_game_message(context, chat_id)
         
         game = mafia_game.games[chat_id]
@@ -334,9 +587,9 @@ async def add_bots_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"🤖 <b>Боти приєднались до гри!</b>\n\n"
-                 f"{'🎭 ' + ', '.join(bot_names)}\n\n"
-                 f"<i>Тепер можна починати гру!</i>",
+            text=f"🤖 <b>Боти приєднались!</b>\n\n"
+                 f"🎭 {', '.join(bot_names)}\n\n"
+                 f"<i>Можна починати!</i>",
             parse_mode=ParseMode.HTML
         )
     else:
@@ -353,14 +606,14 @@ async def leave_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     username = query.from_user.username or query.from_user.first_name
     
     if chat_id not in mafia_game.games:
-        await query.answer("⚠️ Активна гра не знайдена!", show_alert=True)
+        await query.answer("⚠️ Гра не знайдена!", show_alert=True)
         return
     
     if mafia_game.remove_player(chat_id, user_id):
         await update_game_message(context, chat_id)
-        await query.answer(f"👋 {username} вийшов з гри")
+        await query.answer(f"👋 {username} вийшов")
     else:
-        await query.answer("⚠️ Ви не в грі або гра вже почалась!", show_alert=True)
+        await query.answer("⚠️ Ви не в грі або вона вже почалась!", show_alert=True)
 
 
 async def update_game_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
@@ -370,15 +623,11 @@ async def update_game_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     
     game = mafia_game.games[chat_id]
     all_players = mafia_game.get_all_players(chat_id)
-    player_count = len(game['players'])
-    bot_count = len(game['bots'])
-    total_count = player_count + bot_count
     
-    # Показуємо інформацію про спеціальну подію
     event_text = ""
     if game['special_event']:
         event_info = SPECIAL_EVENTS[game['special_event']]
-        event_text = f"\n\n🎲 <b>СПЕЦІАЛЬНА ПОДІЯ!</b>\n{event_info['emoji']} <b>{event_info['name']}</b>\n<i>{event_info['description']}</i>"
+        event_text = f"\n\n🎲 <b>{event_info['emoji']} {event_info['name']}</b>\n<i>{event_info['description']}</i>"
     
     announcement_keyboard = [
         [InlineKeyboardButton("➕ ПРИЄДНАТИСЯ", callback_data="join_game")],
@@ -387,31 +636,30 @@ async def update_game_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         [InlineKeyboardButton("❌ ВИЙТИ", callback_data="leave_game")],
     ]
     
-    # Список гравців
     players_list = ""
     if game['players']:
         players_list += "<b>👥 Гравці:</b>\n"
         for i, pinfo in enumerate(game['players'].values(), 1):
             players_list += f"   {i}. ✅ {pinfo['username']}\n"
     
-    # Список ботів
     if game['bots']:
-        players_list += f"\n<b>🤖 Боти ({bot_count}):</b>\n"
+        players_list += f"\n<b>🤖 Боти ({len(game['bots'])}):</b>\n"
         for i, binfo in enumerate(game['bots'].values(), 1):
             players_list += f"   {i}. 🤖 {binfo['username']}\n"
     
     if not players_list:
         players_list = "<i>Поки що немає...</i>"
     
+    total = len(all_players)
     updated_text = f"""
 🎮 <b>ГРА: МАФІЯ</b> 🎮{event_text}
 
-<b>📊 Учасників ({total_count}/15):</b>
+<b>📊 Учасників ({total}/15):</b>
 {players_list}
 
-{'⏳ <b>Потрібно ще ' + str(5 - total_count) + ' учасників для старту</b>' if total_count < 5 else '🔥 <b>Можна починати гру!</b>'}
+{'⏳ <b>Потрібно ще ' + str(5 - total) + ' учасників</b>' if total < 5 else '🔥 <b>Можна починати!</b>'}
 
-<b>⚠️ ВАЖЛИВО:</b> Напишіть /start боту в особисті повідомлення!
+<b>⚠️ ВАЖЛИВО:</b> Напишіть /start боту в ЛС!
 
 👇 <b>ПРИЄДНУЙТЕСЬ!</b> 👇
 """
@@ -429,9 +677,650 @@ async def update_game_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 
 async def back_to_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Повернення до головного меню гри"""
+    """Повернення до меню гри"""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    await update_game_message(context, chat_id)
+
+
+# ============================================
+# ПОЧАТОК ГРИ
+# ============================================
+
+async def start_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Початок гри"""
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+    user_id = query.from_user.id
+
+    if chat_id not in mafia_game.games:
+        await query.answer("⚠️ Гра не знайдена!", show_alert=True)
+        return
+
+    game = mafia_game.games[chat_id]
+
+    # Перевірка прав
+    if user_id != game['admin_id']:
+        try:
+            chat_member = await context.bot.get_chat_member(chat_id, user_id)
+            if chat_member.status not in ['creator', 'administrator']:
+                await query.answer("⚠️ Тільки адміни можуть почати гру!", show_alert=True)
+                return
+        except Exception:
+            await query.answer("⚠️ Тільки адміни можуть почати гру!", show_alert=True)
+            return
+
+    all_players = mafia_game.get_all_players(chat_id)
+    if len(all_players) < 5:
+        await query.answer(
+            f"⚠️ Недостатньо учасників!\nПотрібно: 5\nЄ: {len(all_players)}", 
+            show_alert=True
+        )
+        return
+
+    if game.get('started'):
+        await query.answer("⚠️ Гра вже почалась!", show_alert=True)
+        return
+
+    if not mafia_game.assign_roles(chat_id):
+        await query.answer("❌ Помилка розподілу ролей!", show_alert=True)
+        return
+
+    game['phase'] = 'night'
+    game['day_number'] = 1
+    game['night_actions'] = {}
+    game['detective_shot_this_night'] = None
+    game['detective_error_target'] = None
+    game['rope_break_save'] = None
+    game['mafia_misfire'] = False
+    game['perks_messages'] = []
+    game['night_resolved'] = False
+
+    await query.edit_message_text(
+        "🎭 <b>ГРА ПОЧИНАЄТЬСЯ!</b> 🎭\n\n"
+        "⏳ Розподіляємо ролі...\n"
+        "📨 Перевірте особисті повідомлення!\n\n"
+        "🌙 Настає перша ніч...", 
+        parse_mode=ParseMode.HTML
+    )
+
+    # Надсилання ролей ТІЛЬКИ живим гравцям (не ботам)
+    failed_users = []
+    for uid, player_info in list(game['players'].items()):
+        try:
+            role_info = mafia_game.get_role_info(player_info['role'])
+            team_emoji = "🔴" if role_info['team'] == 'mafia' else "🔵"
+            team_name = "<b>МАФІЯ</b>" if role_info['team'] == 'mafia' else "<b>МИРНІ ЖИТЕЛІ</b>"
+
+            role_text = f"""
+🎭 <b>━━━ ВАША РОЛЬ ━━━</b> 🎭
+
+{role_info['emoji']} <b>{role_info['full_name']}</b>
+
+📝 <b>Опис:</b>
+{role_info['description']}
+
+{team_emoji} <b>Команда:</b> {team_name}
+
+{'🔪 <b>Ви граєте за мафію!</b> Знищуйте мирних!' if role_info['team'] == 'mafia' else '⚔️ <b>Ви граєте за мирних!</b> Шукайте мафію!'}
+
+⏳ Чекайте на початок ночі...
+"""
+
+            if role_info['team'] == 'mafia':
+                mafia_members = mafia_game.get_mafia_members(chat_id)
+                mafia_list = "\n".join([
+                    f"   • {pinfo['username']} ({mafia_game.get_role_info(pinfo['role'])['name']})"
+                    for m_uid, pinfo in mafia_members if m_uid != uid
+                ])
+                if mafia_list:
+                    role_text += f"\n\n🤝 <b>Ваші союзники:</b>\n{mafia_list}"
+
+            await context.bot.send_message(
+                chat_id=uid,
+                text=role_text,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Помилка надсилання ролі {uid}: {e}") 
+            failed_users.append(uid)
+
+    # Видаляємо тих, кому не вдалося надіслати
+    if failed_users:
+        for uid in failed_users:
+            game['players'].pop(uid, None)
+            game['alive_players'].discard(uid)
+
+        all_remaining = mafia_game.get_all_players(chat_id)
+        if len(all_remaining) < 5:
+            game['started'] = False
+            game['phase'] = 'registration'
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⚠️ <b>Гра не може бути продовжена.</b>\n\n"
+                    "Деяким гравцям не вдалося надіслати ролі.\n"
+                    "Після видалення залишилось < 5 учасників.\n\n"
+                    "🙋 Попросіть усіх написати /start боту в ЛС та створіть нову гру."
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+    # Оновлюємо живих
+    game['alive_players'] = {uid for uid, p in mafia_game.get_all_players(chat_id).items() if p['alive']}
+
+    # Запускаємо першу ніч
+    await night_phase(context, chat_id)
+
+
+# ============================================
+# НІЧНА ФАЗА
+# ============================================
+
+async def night_phase(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Нічна фаза з таймером 45 секунд"""
+    if chat_id not in mafia_game.games:
+        return
+
+    game = mafia_game.games[chat_id]
+    game['phase'] = 'night'
+    game['night_actions'] = {}
+    game['detective_shot_this_night'] = None
+    game['perks_messages'] = []
+    game['night_resolved'] = False
+
+    night_phrase = random.choice(NIGHT_PHRASES)
+    
+    await send_gif(
+        context, 
+        chat_id, 
+        'night',
+        f"🌙 <b>━━━ НІЧ {game['day_number']} ━━━</b> 🌙\n\n"
+        f"{night_phrase}\n\n"
+        f"⏳ У вас є 45 секунд на дії...\n"
+        f"🤫 {random.choice(MAFIA_PHRASES)}"
+    )
+
+    # Таймер: 45 секунд
+    context.job_queue.run_once(night_timeout, when=45, chat_id=chat_id, name=f"night_{chat_id}")
+
+    # Розсилка дій живим гравцям
+    for user_id, player_info in game['players'].items():
+        if not player_info['alive']:
+            continue
+
+        role_key = player_info['role']
+        role_info = mafia_game.get_role_info(role_key)
+        action = role_info.get('action')
+
+        if not action:
+            continue
+
+        all_players = mafia_game.get_all_players(chat_id)
+
+        # Формуємо список цілей
+        if action == 'kill':
+            targets = [
+                (uid, pinfo) for uid, pinfo in all_players.items()
+                if pinfo['alive'] and mafia_game.get_role_info(pinfo['role'])['team'] == 'citizens'
+            ]
+        elif action == 'heal':
+            targets = [
+                (uid, pinfo) for uid, pinfo in all_players.items()
+                if pinfo['alive'] and (uid != user_id or game['last_healed'] != user_id)
+            ]
+        else:  # check
+            targets = [
+                (uid, pinfo) for uid, pinfo in all_players.items()
+                if pinfo['alive'] and uid != user_id
+            ]
+
+        if not targets:
+            continue
+
+        keyboard = []
+        for target_id, target_info in targets:
+            button_emoji = {'kill': '💀', 'heal': '💉', 'check': '🔍'}.get(action, '👤')
+            bot_mark = "🤖 " if target_info['is_bot'] else ""
+            keyboard.append([InlineKeyboardButton(
+                f"{button_emoji} {bot_mark}{target_info['username']}",
+                callback_data=f"night_{action}_{chat_id}_{target_id}"
+            )])
+
+        # Детектив: кнопка стрільби
+        if action == 'check' and not game['detective_bullet_used']:
+            keyboard.append([InlineKeyboardButton(
+                "🔫 ВИСТРІЛИТИ (1 куля)",
+                callback_data=f"night_shoot_{chat_id}_menu"
+            )])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        action_texts = {
+            'kill': (
+                "🔫 <b>━━━ ВИБІР ЖЕРТВИ ━━━</b> 🔫\n\n"
+                f"🌙 Ніч {game['day_number']}\n\n"
+                f"{random.choice(MAFIA_PHRASES)}\n\n"
+                "Оберіть жертву:"
+            ),
+            'heal': (
+                "💉 <b>━━━ РОБОТА ЛІКАРЯ ━━━</b> 💉\n\n"
+                f"🌙 Ніч {game['day_number']}\n\n"
+                "Кого врятувати?\n\n"
+                + ("⚠️ Не можете лікувати себе двічі поспіль!" if game['last_healed'] == user_id else "")
+            ),
+            'check': (
+                "🔍 <b>━━━ РОЗСЛІДУВАННЯ ━━━</b> 🔍\n\n"
+                f"🌙 Ніч {game['day_number']}\n\n"
+                "Кого перевірити?\n\n"
+                "⚠️ Дон має імунітет!\n\n"
+                + ("🔫 Або використайте кулю!" if not game['detective_bullet_used'] else "❌ Куля використана")
+            )
+        }
+
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=action_texts[action],
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Помилка надсилання нічних дій {user_id}: {e}")
+
+    # Боти роблять свої дії автоматично
+    await asyncio.sleep(2)
+    await process_bot_actions(context, chat_id)
+
+
+async def night_timeout(context: ContextTypes.DEFAULT_TYPE):
+    """Таймаут ночі: 45 секунд минуло"""
+    chat_id = context.job.chat_id
+    game = mafia_game.games.get(chat_id)
+    if not game or game['phase'] != 'night' or game.get('night_resolved'):
+        return
+
+    game['night_resolved'] = True
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="⏰ <b>Час ночі вичерпано!</b> Обробляємо результати...", 
+        parse_mode=ParseMode.HTML
+    )
+    await asyncio.sleep(2)
+    await process_night(context, chat_id)
+
+
+async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробка нічних дій"""
     query = update.callback_query
     await query.answer()
     
-    chat_id = query.message.chat_id
-    await update_game_message(context, chat_id)
+    data = query.data.split('_')
+    action = data[1]
+    chat_id = int(data[2])
+    target_id = int(data[3]) if len(data) > 3 and data[3] != 'menu' else 0
+    user_id = query.from_user.id
+    
+    game = mafia_game.games.get(chat_id)
+    if not game or game['phase'] != 'night':
+        await query.edit_message_text("⚠️ Нічна фаза завершилась!")
+        return
+    
+    all_players = mafia_game.get_all_players(chat_id)
+    
+    # Постріл детектива
+    if action == 'shoot':
+        if data[3] == 'menu':
+            alive = [(uid, pinfo) for uid, pinfo in all_players.items() 
+                     if pinfo['alive'] and uid != user_id]
+            
+            shoot_keyboard = []
+            for tid, tinfo in alive:
+                bot_mark = "🤖 " if tinfo['is_bot'] else ""
+                shoot_keyboard.append([InlineKeyboardButton(
+                    f"🔫 {bot_mark}{tinfo['username']}",
+                    callback_data=f"night_shoot_{chat_id}_{tid}"
+                )])
+            shoot_keyboard.append([InlineKeyboardButton(
+                "🔙 Назад до перевірки",
+                callback_data=f"night_back_{chat_id}"
+            )])
+            
+            await query.edit_message_text(
+                "🔫 <b>━━━ ПОСТРІЛ ━━━</b> 🔫\n\n"
+                "⚠️ <b>У вас 1 куля на всю гру!</b>\n\n"
+                "💀 Якщо вистрілите - всі дізнаються\n"
+                "🕯 Обирайте мудро...\n\n"
+                "Ціль:",
+                reply_markup=InlineKeyboardMarkup(shoot_keyboard),
+                parse_mode=ParseMode.HTML
+            )
+            return
+        else:
+            game['detective_bullet_used'] = True
+            game['detective_shot_this_night'] = target_id
+            game['night_actions'][user_id] = {'action': 'shoot', 'target': target_id}
+            
+            target_name = all_players[target_id]['username']
+            
+            await query.edit_message_text(
+                f"🔫 <b>━━━ ПОСТРІЛ! ━━━</b> 🔫\n\n"
+                f"🎯 <b>Ціль:</b> {target_name}\n\n"
+                f"💥 Вистріл пролунав...\n"
+                f"🕯 Хтось не проснеться...\n\n"
+                f"⏳ Результати вранці.\n\n"
+                f"<i>Куля витрачена.</i>",
+                parse_mode=ParseMode.HTML
+            )
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="🔫 <i>Десь у темряві пролунав постріл...</i> 💥",
+                parse_mode=ParseMode.HTML
+            )
+            
+            await check_night_complete(context, chat_id)
+            return
+    
+    # Назад
+    if action == 'back':
+        await query.edit_message_text("🔄 Повертаємось...")
+        return
+    
+    # Звичайні дії
+    game['night_actions'][user_id] = {'action': action, 'target': target_id}
+    
+    action_names = {'kill': 'вбивство', 'heal': 'лікування', 'check': 'перевірку'}
+    action_emojis = {'kill': '💀', 'heal': '💉', 'check': '🔍'}
+    
+    target_name = all_players[target_id]['username']
+    
+    await query.edit_message_text(
+        f"✅ <b>ДІЮ ПІДТВЕРДЖЕНО!</b>\n\n"
+        f"{action_emojis[action]} <b>Ціль:</b> {target_name}\n"
+        f"🎯 <b>Дія:</b> {action_names[action]}\n\n"
+        f"⏳ Чекаємо на інших...\n\n"
+        f"<i>Можете закрити це повідомлення</i>",
+        parse_mode=ParseMode.HTML
+    )
+    
+    player_role = game['players'][user_id]['role']
+    role_info = mafia_game.get_role_info(player_role)
+    
+    choice_messages = {
+        'kill': f"🌙 {role_info['emoji']} <b>Мафія</b> зробила вибір... 😈",
+        'heal': f"🌙 💉 <b>Федорчак</b> зробив вибір... 🏥",
+        'check': f"🌙 🔍 <b>Детектив</b> зробив вибір... 🕵️"
+    }
+    
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=choice_messages[action],
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"Помилка повідомлення: {e}")
+    
+    await check_night_complete(context, chat_id)
+
+
+async def check_night_complete(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Перевірка: всі зробили дії?"""
+    game = mafia_game.games[chat_id]
+    
+    all_players = mafia_game.get_all_players(chat_id)
+    required = sum(
+        1 for pinfo in all_players.values()
+        if pinfo['alive'] and mafia_game.get_role_info(pinfo['role'])['action']
+    )
+    
+    if len(game['night_actions']) >= required and not game.get('night_resolved'):
+        game['night_resolved'] = True
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="✅ <b>Всі зробили вибір!</b>\n\n⏳ Обробка...",
+            parse_mode=ParseMode.HTML
+        )
+        await asyncio.sleep(2)
+        await process_night(context, chat_id)
+
+
+# ============================================
+# ОБРОБКА НОЧІ
+# ============================================
+
+async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Обробка результатів ночі"""
+    game = mafia_game.games[chat_id]
+    all_players = mafia_game.get_all_players(chat_id)
+
+    mafia_target: Optional[int] = None
+    healed_target: Optional[int] = None
+    check_results = []
+    detective_shot: Optional[int] = None
+    potato_kills = []
+
+    # Картопля з Буковеля
+    if game['special_event'] == 'bukovel':
+        for thrower_id, target_id in game.get('potato_throws', {}).items():
+            if random.random() < 0.20:  # 20% влучити
+                potato_kills.append((thrower_id, target_id))
+                game['perks_messages'].append(
+                    f"🥔💥 <b>{random.choice(POTATO_PHRASES)}</b>\n"
+                    f"💀 Бульба забрала життя!"
+                )
+
+    # Розбір нічних дій
+    for user_id, action_info in game['night_actions'].items():
+        action = action_info['action']
+        target = action_info['target']
+
+        if action == 'kill':
+            mafia_target = target
+        elif action == 'heal':
+            healed_target = target
+            game['last_healed'] = healed_target
+        elif action == 'check':
+            target_role_key = all_players[target]['role']
+            role_info = mafia_game.get_role_info(target_role_key)
+
+            detective_error = random.random() < 0.05
+
+            if target_role_key == 'kishkel':
+                is_mafia = False
+            else:
+                is_mafia = (role_info['team'] == 'mafia')
+                if detective_error:
+                    is_mafia = not is_mafia
+                    game['detective_error_target'] = target
+
+            check_results.append((user_id, target, is_mafia, detective_error))
+        elif action == 'shoot':
+            detective_shot = target
+
+    victims = set()
+    saved = False
+    mafia_misfire = False
+
+    # Постріл мафії
+    if mafia_target is not None:
+        if random.random() < 0.05:
+            mafia_misfire = True
+            game['perks_messages'].append(
+                "🎲 <b>ПЕРК: ОСІЧКА МАФІЇ!</b>\n🔫❌ Зброя заклинила!"
+            )
+        else:
+            victims.add(mafia_target)
+
+    # Лікування
+    if healed_target and mafia_target == healed_target and mafia_target in victims:
+        victims.remove(healed_target)
+        saved = True
+        game['perks_messages'].append(
+            f"💉 <b>{random.choice(SAVED_PHRASES)}</b>"
+        )
+
+    # Постріл детектива
+    if detective_shot:
+        if healed_target == detective_shot:
+            game['perks_messages'].append(
+                "💉 <b>Федорчак врятував від пострілу детектива!</b>"
+            )
+        else:
+            victims.add(detective_shot)
+            game['perks_messages'].append(
+                "🔫 <b>Детектив відкрив вогонь!</b>\n💀 Постріл забрав життя!"
+            )
+
+    # Картопля
+    for thrower_id, target_id in potato_kills:
+        victims.add(target_id)
+
+    game['mafia_misfire'] = mafia_misfire
+
+    # Застосовуємо смерті
+    for vid in victims:
+        all_players[vid]['alive'] = False
+        game['alive_players'].discard(vid)
+
+    # Результати детективу
+    for detective_id, target_id, is_mafia, had_error in check_results:
+        if detective_id not in game['players']:
+            continue
+        target_name = all_players[target_id]['username']
+
+        result_text = f"""
+🔍 <b>━━━ РЕЗУЛЬТАТ РОЗСЛІДУВАННЯ ━━━</b> 🔍
+
+<b>Перевірений:</b> {target_name}
+
+<b>Результат:</b>
+{'🔴 <b>МАФІЯ!</b> Це злочинець!' if is_mafia else '🔵 <b>МИРНИЙ!</b> Чесна людина.'}
+
+{'⚠️ Обережно з цією інформацією!' if is_mafia else '✅ Можна довіряти.'}
+"""
+        try:
+            await context.bot.send_message(
+                chat_id=detective_id,
+                text=result_text,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Помилка детективу: {e}")
+
+    # День
+    game['phase'] = 'day'
+
+    await send_gif(
+        context,
+        chat_id,
+        'morning',
+        f"{random.choice(MORNING_PHRASES)}\n🌅 Село прокидається..."
+    )
+    await asyncio.sleep(2)
+
+    perks_block = ""
+    if game['perks_messages']:
+        perks_block = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" + "\n".join(game['perks_messages']) + "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Оголошення результатів
+    if victims:
+        if len(victims) == 1:
+            killed = next(iter(victims))
+            killed_name = all_players[killed]['username']
+            killed_role = mafia_game.get_role_info(all_players[killed]['role'])
+
+            death_phrase = random.choice(DEATH_PHRASES)
+
+            night_result = f"""
+☀️ <b>━━━━━ РАНОК ДНЯ {game['day_number']} ━━━━━</b> ☀️
+
+💀 <b>ТРАГІЧНА НОВИНА!</b> 💀
+
+<i>Жителі села виявили страшну знахідку...</i>
+
+💀 <b>Загинув:</b> {killed_name}
+🎭 <b>Роль:</b> {killed_role['emoji']} {killed_role['full_name']}
+
+{death_phrase}{perks_block}
+
+🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> (60 сек)
+
+{random.choice(DISCUSSION_PHRASES)}
+"""
+        else:
+            lines = []
+            for vid in victims:
+                pinfo = all_players[vid]
+                rinfo = mafia_game.get_role_info(pinfo['role'])
+                bot_mark = "🤖 " if pinfo['is_bot'] else ""
+                lines.append(f"💀 <b>{bot_mark}{pinfo['username']}</b> — {rinfo['emoji']} {rinfo['full_name']}")
+            victims_block = "\n".join(lines)
+
+            night_result = f"""
+☀️ <b>━━━━━ РАНОК ДНЯ {game['day_number']} ━━━━━</b> ☀️
+
+💀 <b>КРИВАВА НІЧ!</b> 💀
+
+{victims_block}{perks_block}
+
+🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> (60 сек)
+
+{random.choice(DISCUSSION_PHRASES)}
+"""
+    elif saved:
+        saved_name = all_players[healed_target]['username']
+        saved_phrase = random.choice(SAVED_PHRASES)
+
+        night_result = f"""
+☀️ <b>━━━━━ РАНОК ДНЯ {game['day_number']} ━━━━━</b> ☀️
+
+🎉 <b>ДИВО!</b> 🎉
+
+💉 <b>Федорчак</b> врятував <b>{saved_name}</b>!
+
+{saved_phrase}{perks_block}
+
+🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> (60 сек)
+
+{random.choice(DISCUSSION_PHRASES)}
+"""
+    else:
+        night_result = f"""
+☀️ <b>━━━━━ РАНОК ДНЯ {game['day_number']} ━━━━━</b> ☀️
+
+😌 <b>СПОКІЙНА НІЧ!</b> 😌
+
+🕊 Всі живі!{perks_block}
+
+🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> (60 сек)
+
+{random.choice(DISCUSSION_PHRASES)}
+"""
+
+    await send_gif(context, chat_id, 'death' if victims else 'morning', night_result)
+
+    # Перевірка перемоги
+    if await check_victory(context, chat_id):
+        return
+
+    # Обговорення 60 секунд
+    game['phase'] = 'discussion'
+    game['discussion_started'] = True
+    context.job_queue.run_once(discussion_timeout, when=60, chat_id=chat_id, name=f"discussion_{chat_id}")
+
+
+async def discussion_timeout(context: ContextTypes.DEFAULT_TYPE):
+    """Завершення обговорення → голосування"""
+    chat_id = context.job.chat_id
+    game = mafia_game.games.get(chat_id)
+    if not game or game['phase'] != 'discussion':
+        return
+
+    await context.bot.send_message(
+        chat_id=chat_i
