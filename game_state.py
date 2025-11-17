@@ -41,6 +41,7 @@ class MafiaGame:
             'mafia_misfire': False,
             'perks_messages': [],
             'night_resolved': False,
+            'nominations_done': False,
             'final_voting_done': False,
             'discussion_started': False,
             'special_event': special_event,

@@ -60,6 +60,12 @@ def _merge_players(game: dict) -> dict:
     return combined
 
 
+def _cancel_jobs(job_queue, name: str):
+    """Видаляє всі задачі з певною назвою, щоб уникнути подвійного виконання"""
+    for job in job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+
+
 async def send_gif(context: ContextTypes.DEFAULT_TYPE, chat_id: int, gif_type: str, caption: str = None):
     """Відправка GIF файлу"""
     try:
@@ -928,6 +934,48 @@ async def start_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
+        # Якщо гравців все ще достатньо — повертаємо гру до стадії реєстрації
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⚠️ <b>Роздачу ролей скасовано.</b>\n\n"
+                "Не всім вдалося надіслати ЛС, тому ролі не розкриті.\n"
+                "Гру повернуто до реєстрації — спробуйте почати її знову,"
+                " коли всі гравці активують бота."
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
+        game['started'] = False
+        game['phase'] = 'registration'
+        game['day_number'] = 0
+        game['night_actions'] = {}
+        game['votes'] = {}
+        game['vote_nominee'] = None
+        game['vote_results'] = {}
+        game['night_resolved'] = False
+        game['nominations_done'] = False
+        game['final_voting_done'] = False
+        game['discussion_started'] = False
+        game['detective_bullet_used'] = False
+        game['detective_shot_this_night'] = None
+        game['perks_messages'] = []
+        game['potato_throws'] = {}
+        game['special_items'] = {}
+
+        for player_info in game['players'].values():
+            player_info['role'] = None
+            player_info['alive'] = True
+
+        for bot_info in game['bots'].values():
+            bot_info['role'] = None
+            bot_info['alive'] = True
+
+        game['alive_players'] = set()
+
+        await update_game_message(context, chat_id)
+        return
+
     # Оновлюємо живих
     game['alive_players'] = {uid for uid, p in mafia_game.get_all_players(chat_id).items() if p['alive']}
 
@@ -1071,9 +1119,10 @@ async def night_timeout(context: ContextTypes.DEFAULT_TYPE):
         return
 
     game['night_resolved'] = True
+    _cancel_jobs(context.job_queue, f"night_{chat_id}")
     await context.bot.send_message(
         chat_id=chat_id,
-        text="⏰ <b>Час ночі вичерпано!</b> Обробляємо результати...", 
+        text="⏰ <b>Час ночі вичерпано!</b> Обробляємо результати...",
         parse_mode=ParseMode.HTML
     )
     await asyncio.sleep(2)
@@ -1256,16 +1305,19 @@ async def potato_throw_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def check_night_complete(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """Перевірка: всі зробили дії?"""
-    game = mafia_game.games[chat_id]
-    
+    game = mafia_game.games.get(chat_id)
+    if not game:
+        return
+
     all_players = mafia_game.get_all_players(chat_id)
     required = sum(
         1 for pinfo in all_players.values()
         if pinfo['alive'] and mafia_game.get_role_info(pinfo['role'])['action']
     )
-    
+
     if len(game['night_actions']) >= required and not game.get('night_resolved'):
         game['night_resolved'] = True
+        _cancel_jobs(context.job_queue, f"night_{chat_id}")
         await context.bot.send_message(
             chat_id=chat_id,
             text="✅ <b>Всі зробили вибір!</b>\n\n⏳ Обробка...",
@@ -1288,6 +1340,7 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     healed_target: Optional[int] = None
     check_results = []
     detective_shot: Optional[int] = None
+    potato_results = []
     potato_kills = []
     discussion_duration = TIMERS['discussion']
     potato_actions = dict(game.get('potato_throws', {}))
@@ -1302,6 +1355,13 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             if not target:
                 continue
 
+            potato_results.append({
+                'thrower_id': thrower_id,
+                'target_id': target_id,
+                'thrower_name': thrower['username'] if thrower else "Гравець",
+                'target_name': target['username'],
+                'hit': random.random() < 0.20
+            })
             thrower_name = thrower['username'] if thrower else "Гравець"
             target_name = target['username']
 
@@ -1378,9 +1438,26 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 "🔫 <b>Детектив відкрив вогонь!</b>\n💀 Постріл забрав життя!"
             )
 
-    # Картопля
-    for thrower_id, target_id in potato_kills:
-        victims.add(target_id)
+    # Картопля (після інших дій)
+    for result in potato_results:
+        if not result['hit']:
+            game['perks_messages'].append(
+                f"🥔 <b>{result['thrower_name']}</b> промахнувся по <b>{result['target_name']}</b>!"
+            )
+            continue
+
+        if result['target_id'] in victims:
+            game['perks_messages'].append(
+                f"🥔 <b>{result['thrower_name']}</b> влучив у <b>{result['target_name']}</b>,"
+                " але її вже прибрали до цього!"
+            )
+            continue
+
+        victims.add(result['target_id'])
+        game['perks_messages'].append(
+            f"🥔💥 <b>{random.choice(POTATO_PHRASES)}</b>\n"
+            f"<b>{result['thrower_name']}</b> влучив у <b>{result['target_name']}</b>!"
+        )
 
     game['mafia_misfire'] = mafia_misfire
 
@@ -1552,6 +1629,7 @@ async def start_voting(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     game['phase'] = 'voting'
     game['vote_nominee'] = None
     game['votes'] = {}
+    game['nominations_done'] = False
     game['final_voting_done'] = False
     
     all_players = mafia_game.get_all_players(chat_id)
@@ -1683,12 +1761,15 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_nominations_complete(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """Перевірка завершення висунення"""
-    game = mafia_game.games[chat_id]
-    
+    game = mafia_game.games.get(chat_id)
+    if not game or game.get('nominations_done'):
+        return
+
     all_players = mafia_game.get_all_players(chat_id)
     alive_count = sum(1 for p in all_players.values() if p['alive'])
-    
+
     if len(game['votes']) >= alive_count:
+        game['nominations_done'] = True
         # Підрахунок
         nominations = defaultdict(int)
         for nominated in game['votes'].values():
@@ -1915,7 +1996,8 @@ async def check_victory(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> boo
     all_players = mafia_game.get_all_players(chat_id)
     alive_mafia = 0
     alive_citizens = 0
-    
+    any_humans_alive = any(player['alive'] for player in game['players'].values())
+
     for user_id in game['alive_players']:
         player = all_players[user_id]
         role = player['role']
@@ -1938,9 +2020,19 @@ async def check_victory(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> boo
 
 <b>Вітаємо героїв! 🦸‍♂️</b>
 """
-    elif alive_mafia >= alive_citizens:
+    elif alive_mafia >= alive_citizens or not any_humans_alive:
         winner = 'mafia'
-        victory_text = """
+        if not any_humans_alive and alive_mafia < alive_citizens:
+            victory_text = """
+💀💀💀 <b>ГРУ ЗАВЕРШЕНО!</b> 💀💀💀
+
+🙅 Людей у грі більше не залишилось.
+🤖 Лише боти продовжували б раунд, тому гра завершується.
+
+Мафія оголошена переможцем автоматично.
+"""
+        else:
+            victory_text = """
 💀💀💀 <b>ПЕРЕМОГА МАФІЇ!</b> 💀💀💀
 
 🔫 Мафія захопила село!
