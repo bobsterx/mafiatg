@@ -1341,6 +1341,7 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     check_results = []
     detective_shot: Optional[int] = None
     potato_results = []
+    potato_kills = []
     discussion_duration = TIMERS['discussion']
     potato_actions = dict(game.get('potato_throws', {}))
     game['potato_throws'] = {}
@@ -1361,6 +1362,19 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 'target_name': target['username'],
                 'hit': random.random() < 0.20
             })
+            thrower_name = thrower['username'] if thrower else "Гравець"
+            target_name = target['username']
+
+            if random.random() < 0.20:  # 20% влучити
+                potato_kills.append((thrower_id, target_id))
+                game['perks_messages'].append(
+                    f"🥔💥 <b>{random.choice(POTATO_PHRASES)}</b>\n"
+                    f"<b>{thrower_name}</b> влучив у <b>{target_name}</b>!"
+                )
+            else:
+                game['perks_messages'].append(
+                    f"🥔 <b>{thrower_name}</b> промахнувся по <b>{target_name}</b>!"
+                )
 
     # Розбір нічних дій
     for user_id, action_info in game['night_actions'].items():
