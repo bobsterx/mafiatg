@@ -43,10 +43,22 @@ logging.basicConfig(
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# Перевіряємо наявність GIF файлів одразу при завантаженні модуля
+for gif_type, gif_path in GIF_PATHS.items():
+    if not os.path.exists(gif_path):
+        logger.warning(f"⚠️ GIF не знайдено: {gif_type} -> {gif_path}")
+
 
 # ============================================
 # ДОПОМІЖНІ ФУНКЦІЇ
 # ============================================
+
+def _merge_players(game: dict) -> dict:
+    """Комбінує гравців та ботів у один словник"""
+    combined = dict(game['players'])
+    combined.update(game['bots'])
+    return combined
+
 
 async def send_gif(context: ContextTypes.DEFAULT_TYPE, chat_id: int, gif_type: str, caption: str = None):
     """Відправка GIF файлу"""
@@ -169,25 +181,29 @@ async def check_dead_player_message(update: Update, context: ContextTypes.DEFAUL
 # ============================================
 
 def bot_mafia_choice(game: dict, bot_id: int) -> Optional[int]:
-    """Мафія вибирає жертву випадково з мирних"""
+    """Мафія вибирає жертву випадково з живих мирних (включно з ботами)"""
+    all_players = _merge_players(game)
     citizens = [
-        uid for uid, pinfo in game['players'].items()
-        if pinfo['alive'] and mafia_game.get_role_info(pinfo['role'])['team'] == 'citizens'
+        uid for uid, pinfo in all_players.items()
+        if pinfo['alive']
+        and uid != bot_id
+        and mafia_game.get_role_info(pinfo['role'])['team'] == 'citizens'
     ]
     return random.choice(citizens) if citizens else None
 
 
 def bot_doctor_choice(game: dict, bot_id: int) -> Optional[int]:
-    """Лікар лікує випадково (не себе двічі поспіль)"""
+    """Лікар лікує випадково (враховуючи всіх живих) і не себе двічі поспіль"""
+    all_players = _merge_players(game)
     targets = [
-        uid for uid, pinfo in game['players'].items()
+        uid for uid, pinfo in all_players.items()
         if pinfo['alive'] and (uid != bot_id or game['last_healed'] != bot_id)
     ]
     return random.choice(targets) if targets else None
 
 
 def bot_voting_choice(game: dict, bot_id: int) -> int:
-    """Бот голосує за гравця з 2+ голосами або за випадкового"""
+    """Бот голосує за гравця з 2+ голосами або за випадкового живого"""
     # Підраховуємо голоси
     vote_counts = defaultdict(int)
     for voted_for in game['votes'].values():
@@ -200,8 +216,9 @@ def bot_voting_choice(game: dict, bot_id: int) -> int:
         return random.choice(candidates)
     
     # Інакше випадковий живий гравець (крім себе)
+    all_players = _merge_players(game)
     alive = [
-        uid for uid, pinfo in game['players'].items()
+        uid for uid, pinfo in all_players.items()
         if pinfo['alive'] and uid != bot_id
     ]
     return random.choice(alive) if alive else 0
@@ -244,6 +261,43 @@ async def process_bot_actions(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 text=f"🤖 <b>{bot_name}</b> {action_emoji.get(action, '✅')} зробив свій вибір...",
                 parse_mode=ParseMode.HTML
             )
+
+    # Боти також можуть кидати картоплю під час події "Буковель"
+    if game.get('special_event') == 'bukovel':
+        all_players = mafia_game.get_all_players(chat_id)
+
+        for bot_id, bot_info in game['bots'].items():
+            if not bot_info['alive']:
+                continue
+
+            if mafia_game.get_player_item(chat_id, bot_id) != 'potato':
+                continue
+
+            if bot_id in game['potato_throws']:
+                continue
+
+            if random.random() >= 0.5:
+                continue
+
+            alive_targets = [
+                uid for uid, pinfo in all_players.items()
+                if pinfo['alive'] and uid != bot_id
+            ]
+
+            if not alive_targets:
+                continue
+
+            target = random.choice(alive_targets)
+
+            if mafia_game.use_potato(chat_id, bot_id, target):
+                bot_name = bot_info['username']
+                target_name = all_players[target]['username']
+
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🤖🥔 <b>{bot_name}</b> кинув картоплю в <b>{target_name}</b>!",
+                    parse_mode=ParseMode.HTML
+                )
 
 
 async def process_bot_votes(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
