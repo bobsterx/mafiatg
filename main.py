@@ -35,7 +35,11 @@ logger = logging.getLogger(__name__)
 def main() -> None:
     """Головна функція запуску бота"""
     # Токен тепер безпечніше зчитується з змінної оточення
-    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE")
+    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not TOKEN or TOKEN == "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE":
+        logger.error("❌ TELEGRAM_BOT_TOKEN не встановлено!")
+        logger.error("Вкажіть токен у змінній оточення TELEGRAM_BOT_TOKEN.")
+        raise SystemExit(1)
 
     application = Application.builder().token(TOKEN).build()
 

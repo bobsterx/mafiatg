@@ -41,6 +41,7 @@ class MafiaGame:
             'mafia_misfire': False,
             'perks_messages': [],
             'night_resolved': False,
+            'nominations_done': False,
             'final_voting_done': False,
             'discussion_started': False,
             'special_event': special_event,
@@ -241,5 +242,31 @@ class MafiaGame:
                     citizens.append((user_id, player_info))
         
         return citizens
+
+    def get_player_item(self, chat_id: int, user_id: int) -> Optional[str]:
+        """Повертає спеціальний предмет гравця (якщо є)"""
+        if chat_id not in self.games:
+            return None
+        return self.games[chat_id]['special_items'].get(user_id)
+
+    def use_potato(self, chat_id: int, thrower_id: int, target_id: int) -> bool:
+        """Фіксує кидок картоплі (одноразовий предмет)"""
+        if chat_id not in self.games:
+            return False
+
+        game = self.games[chat_id]
+        if game['special_items'].get(thrower_id) != 'potato':
+            return False
+
+        if thrower_id not in game['alive_players']:
+            return False
+
+        if target_id == thrower_id or target_id not in game['alive_players']:
+            return False
+
+        # Забираємо предмет та зберігаємо вибір
+        del game['special_items'][thrower_id]
+        game['potato_throws'][thrower_id] = target_id
+        return True
 
 mafia_game = MafiaGame()
