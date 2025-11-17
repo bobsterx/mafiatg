@@ -1,0 +1,437 @@
+"""Telegram handlers and game flow for the Mafia bot - Part 1."""
+
+import os
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.ext import ContextTypes
+from telegram.constants import ParseMode
+from collections import defaultdict
+import asyncio
+import random
+from typing import Optional
+
+from config import (
+    ROLES, DEATH_PHRASES, SAVED_PHRASES, MAFIA_PHRASES, 
+    DISCUSSION_PHRASES, MORNING_PHRASES, NIGHT_PHRASES,
+    POTATO_PHRASES, SPECIAL_EVENTS, GIF_PATHS
+)
+from game_state import mafia_game
+
+# Налаштування логування
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+
+async def send_gif(context: ContextTypes.DEFAULT_TYPE, chat_id: int, gif_type: str, caption: str = None):
+    """Відправка GIF файлу"""
+    try:
+        gif_path = GIF_PATHS.get(gif_type)
+        if gif_path and os.path.exists(gif_path):
+            with open(gif_path, 'rb') as gif:
+                await context.bot.send_animation(
+                    chat_id=chat_id,
+                    animation=gif,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML
+                )
+        elif caption:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=caption,
+                parse_mode=ParseMode.HTML
+            )
+    except Exception as e:
+        logger.error(f"Помилка відправки GIF: {e}")
+        if caption:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=caption,
+                parse_mode=ParseMode.HTML
+            )
+
+
+async def check_dead_player_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Блокує повідомлення від мертвих гравців"""
+    if not update.message or not update.message.text:
+        return
+    
+    chat_id = update.message.chat_id
+    user_id = update.message.from_user.id
+    
+    if chat_id in mafia_game.games:
+        game = mafia_game.games[chat_id]
+        if game['started'] and user_id in game['players'] and not game['players'][user_id]['alive']:
+            try:
+                await update.message.delete()
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="💀 <b>ТИ МЕРТВИЙ!</b>\n\nНе можеш писати в чат до кінця гри.\n🤐 Дотримуйся правил!",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                logger.error(f"Помилка видалення повідомлення мертвого гравця: {e}")
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start - показує головне меню"""
+    if update.message and update.message.chat.type != 'private':
+        await update.message.reply_text(
+            "👋 <b>Вітаю в грі МАФІЯ!</b>\n\n"
+            "📝 Щоб керувати грою, напишіть мені /start в особистих повідомленнях!\n"
+            "🎮 Команди в групі:\n"
+            "   /newgame - створити нову гру\n"
+            "   /endgame - завершити поточну гру\n"
+            "   /status - статус гри\n\n"
+            "💡 <b>Важливо:</b> Спочатку напишіть боту в особисті повідомлення /start!",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("📜 Правила гри", callback_data="menu_rules")],
+        [InlineKeyboardButton("🎮 Як грати?", callback_data="menu_howto")],
+        [InlineKeyboardButton("👥 Персонажі", callback_data="menu_characters")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    welcome_text = """
+🎭 <b>МАФІЯ - Telegram Bot</b> 🎭
+
+Вітаю в класичній грі МАФІЯ!
+
+<b>⭐ Головні персонажі:</b>
+🌾 <b>Демян</b> - Простий селянин
+👑 <b>Кішкель</b> - Дон мафії (імунітет)
+🔫 <b>Ігор Рогальський</b> - Мафіозі
+💉 <b>Федорчак</b> - Лікар-рятівник
+🔍 <b>Детектив</b> - Шукач правди (+ 1 куля)
+
+<b>🎯 Мета:</b>
+🔵 Мирні - знищити мафію
+🔴 Мафія - знищити мирних
+
+<b>🎲 Нові фічі:</b>
+- 🤖 Можна додати ботів (1-10)
+- 🥔 Спеціальні події (30% шанс)
+- 🔫 Детектив може вистрілити
+- 🎪 Рандомні перки (5% шанс)
+
+Оберіть розділ нижче! 👇
+"""
+    
+    if update.message:
+        await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+    else:
+        await update.callback_query.message.edit_text(welcome_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+
+
+async def newgame_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /newgame - створення гри в групі"""
+    if update.message.chat.type == 'private':
+        await update.message.reply_text(
+            "⚠️ Ця команда працює тільки в груповому чаті!",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    chat_id = update.message.chat_id
+    admin_id = update.message.from_user.id
+    
+    if chat_id in mafia_game.games and mafia_game.games[chat_id]['started']:
+        await update.message.reply_text(
+            "⚠️ <b>Гра вже йде!</b>\n\nЗавершіть поточну гру командою /endgame",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    game = mafia_game.create_game(chat_id, admin_id)
+    
+    # Показуємо інформацію про спеціальну подію
+    event_text = ""
+    if game['special_event']:
+        event_info = SPECIAL_EVENTS[game['special_event']]
+        event_text = f"\n\n🎲 <b>СПЕЦІАЛЬНА ПОДІЯ!</b>\n{event_info['emoji']} <b>{event_info['name']}</b>\n<i>{event_info['description']}</i>\n"
+    
+    announcement_keyboard = [
+        [InlineKeyboardButton("➕ ПРИЄДНАТИСЯ", callback_data="join_game")],
+        [InlineKeyboardButton("🤖 ДОДАТИ БОТІВ", callback_data="add_bots_menu")],
+        [InlineKeyboardButton("🎯 ПОЧАТИ ГРУ", callback_data="start_game")],
+        [InlineKeyboardButton("❌ ВИЙТИ", callback_data="leave_game")],
+    ]
+    
+    announcement_text = f"""
+🎮 <b>━━━ НОВА ГРА СТВОРЕНА! ━━━</b> 🎮
+
+🎭 <b>МАФІЯ</b> запрошує гравців!{event_text}
+
+<b>🎯 Правила:</b>
+- Мінімум 5 учасників (гравці + боти)
+- Максимум 15 учасників
+- Можна додати ботів (1-10)
+- Гра триває до перемоги
+
+<b>👥 Гравці (0/15):</b>
+<i>Поки що немає...</i>
+
+<b>🤖 Ботів: 0</b>
+
+<b>⚠️ ВАЖЛИВО:</b> Напишіть /start боту в особисті повідомлення!
+
+👇 <b>ПРИЄДНУЙТЕСЬ ЗАРАЗ!</b> 👇
+"""
+    
+    msg = await update.message.reply_text(
+        announcement_text,
+        reply_markup=InlineKeyboardMarkup(announcement_keyboard),
+        parse_mode=ParseMode.HTML
+    )
+    
+    mafia_game.game_messages[chat_id] = msg.message_id
+
+    """Telegram handlers - Part 2: Registration and Bots."""
+
+import random
+import asyncio
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+from telegram.constants import ParseMode
+
+from game_state import mafia_game
+from config import SPECIAL_EVENTS
+
+logger = logging.getLogger(__name__)
+
+
+async def join_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приєднання до гри"""
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = query.message.chat_id
+    user_id = query.from_user.id
+    username = query.from_user.username or query.from_user.first_name
+    
+    if chat_id not in mafia_game.games:
+        await query.answer("⚠️ Створіть гру командою /newgame!", show_alert=True)
+        return
+    
+    game = mafia_game.games[chat_id]
+    total_players = len(game['players']) + len(game['bots'])
+    
+    if total_players >= 15:
+        await query.answer("⚠️ Гра повна! Максимум 15 гравців.", show_alert=True)
+        return
+    
+    if mafia_game.add_player(chat_id, user_id, username):
+        player_count = len(game['players'])
+        
+        try:
+            welcome_msg = f"""
+✅ <b>ВИ В ГРІ!</b> 🎉
+
+Вітаємо, <b>{username}</b>!
+
+Ви успішно приєдналися до гри МАФІЯ!
+
+🎮 <b>Що далі?</b>
+- Чекайте на початок гри
+- Отримаєте свою роль в особисті повідомлення
+- Грайте та перемагайте!
+
+<b>👥 Гравців зараз:</b> {player_count}
+<b>🤖 Ботів:</b> {len(game['bots'])}
+{'⏳ Потрібно ще ' + str(5 - total_players - 1) + ' учасників' if total_players + 1 < 5 else '✅ Можна починати!'}
+
+<i>Удачі в грі! 🍀</i>
+"""
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=welcome_msg,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Не можу надіслати повідомлення {user_id}: {e}")
+            del game['players'][user_id]
+            await query.answer(
+                "⚠️ Я не можу надіслати вам повідомлення!\n"
+                "Напишіть мені /start в особистих повідомленнях спочатку!",
+                show_alert=True
+            )
+            return
+        
+        await update_game_message(context, chat_id)
+        await query.answer(f"✅ {username} приєднався! 🎉")
+    else:
+        await query.answer("⚠️ Ви вже в грі!", show_alert=True)
+
+
+async def add_bots_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню додавання ботів"""
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = query.message.chat_id
+    
+    if chat_id not in mafia_game.games:
+        await query.answer("⚠️ Створіть гру командою /newgame!", show_alert=True)
+        return
+    
+    game = mafia_game.games[chat_id]
+    total_players = len(game['players']) + len(game['bots'])
+    available_slots = 15 - total_players
+    
+    if available_slots <= 0:
+        await query.answer("⚠️ Гра повна! Не можна додати ботів.", show_alert=True)
+        return
+    
+    keyboard = []
+    for i in [1, 2, 3, 5, 10]:
+        if i <= available_slots:
+            keyboard.append([InlineKeyboardButton(
+                f"🤖 Додати {i} бот{'а' if i in [2, 3] else 'ів' if i > 3 else ''}",
+                callback_data=f"add_bots_{i}"
+            )])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_game")])
+    
+    await query.edit_message_text(
+        f"🤖 <b>ДОДАТИ БОТІВ</b>\n\n"
+        f"👥 Зараз гравців: {len(game['players'])}\n"
+        f"🤖 Зараз ботів: {len(game['bots'])}\n"
+        f"📊 Вільних місць: {available_slots}\n\n"
+        f"<b>Скільки ботів додати?</b>",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def add_bots_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Додавання ботів до гри"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data.split('_')
+    count = int(data[2])
+    chat_id = query.message.chat_id
+    
+    if chat_id not in mafia_game.games:
+        await query.answer("⚠️ Гра не знайдена!", show_alert=True)
+        return
+    
+    added = mafia_game.add_bots(chat_id, count)
+    
+    if added > 0:
+        await query.answer(f"✅ Додано {added} бот{'а' if added in [2, 3] else 'ів'}!", show_alert=True)
+        await update_game_message(context, chat_id)
+        
+        game = mafia_game.games[chat_id]
+        bot_names = [b['username'] for b in game['bots'].values()]
+        
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🤖 <b>Боти приєднались до гри!</b>\n\n"
+                 f"{'🎭 ' + ', '.join(bot_names)}\n\n"
+                 f"<i>Тепер можна починати гру!</i>",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await query.answer("⚠️ Не вдалось додати ботів!", show_alert=True)
+
+
+async def leave_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вихід з гри"""
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = query.message.chat_id
+    user_id = query.from_user.id
+    username = query.from_user.username or query.from_user.first_name
+    
+    if chat_id not in mafia_game.games:
+        await query.answer("⚠️ Активна гра не знайдена!", show_alert=True)
+        return
+    
+    if mafia_game.remove_player(chat_id, user_id):
+        await update_game_message(context, chat_id)
+        await query.answer(f"👋 {username} вийшов з гри")
+    else:
+        await query.answer("⚠️ Ви не в грі або гра вже почалась!", show_alert=True)
+
+
+async def update_game_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Оновлення повідомлення про гру"""
+    if chat_id not in mafia_game.games or chat_id not in mafia_game.game_messages:
+        return
+    
+    game = mafia_game.games[chat_id]
+    all_players = mafia_game.get_all_players(chat_id)
+    player_count = len(game['players'])
+    bot_count = len(game['bots'])
+    total_count = player_count + bot_count
+    
+    # Показуємо інформацію про спеціальну подію
+    event_text = ""
+    if game['special_event']:
+        event_info = SPECIAL_EVENTS[game['special_event']]
+        event_text = f"\n\n🎲 <b>СПЕЦІАЛЬНА ПОДІЯ!</b>\n{event_info['emoji']} <b>{event_info['name']}</b>\n<i>{event_info['description']}</i>"
+    
+    announcement_keyboard = [
+        [InlineKeyboardButton("➕ ПРИЄДНАТИСЯ", callback_data="join_game")],
+        [InlineKeyboardButton("🤖 ДОДАТИ БОТІВ", callback_data="add_bots_menu")],
+        [InlineKeyboardButton("🎯 ПОЧАТИ ГРУ", callback_data="start_game")],
+        [InlineKeyboardButton("❌ ВИЙТИ", callback_data="leave_game")],
+    ]
+    
+    # Список гравців
+    players_list = ""
+    if game['players']:
+        players_list += "<b>👥 Гравці:</b>\n"
+        for i, pinfo in enumerate(game['players'].values(), 1):
+            players_list += f"   {i}. ✅ {pinfo['username']}\n"
+    
+    # Список ботів
+    if game['bots']:
+        players_list += f"\n<b>🤖 Боти ({bot_count}):</b>\n"
+        for i, binfo in enumerate(game['bots'].values(), 1):
+            players_list += f"   {i}. 🤖 {binfo['username']}\n"
+    
+    if not players_list:
+        players_list = "<i>Поки що немає...</i>"
+    
+    updated_text = f"""
+🎮 <b>ГРА: МАФІЯ</b> 🎮{event_text}
+
+<b>📊 Учасників ({total_count}/15):</b>
+{players_list}
+
+{'⏳ <b>Потрібно ще ' + str(5 - total_count) + ' учасників для старту</b>' if total_count < 5 else '🔥 <b>Можна починати гру!</b>'}
+
+<b>⚠️ ВАЖЛИВО:</b> Напишіть /start боту в особисті повідомлення!
+
+👇 <b>ПРИЄДНУЙТЕСЬ!</b> 👇
+"""
+    
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=mafia_game.game_messages[chat_id],
+            text=updated_text,
+            reply_markup=InlineKeyboardMarkup(announcement_keyboard),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"Помилка оновлення повідомлення: {e}")
+
+
+async def back_to_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Повернення до головного меню гри"""
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = query.message.chat_id
+    await update_game_message(context, chat_id)
