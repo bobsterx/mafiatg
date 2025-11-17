@@ -44,9 +44,9 @@ def main() -> None:
     application = Application.builder().token(TOKEN).build()
 
     if application.job_queue is None:
-        logger.error("⏱️ JobQueue недоступний — таймери гри не зможуть працювати.")
-        logger.error('Встановіть залежність: pip install "python-telegram-bot[job-queue]"')
-        raise SystemExit(1)
+        logger.warning("⏱️ JobQueue недоступний — таймери гри не зможуть працювати.")
+        logger.warning('Встановіть залежність: pip install "python-telegram-bot[job-queue]"')
+        logger.warning("Бот продовжує роботу, але фази потрібно завершувати вручну.")
 
     # Команди
     application.add_handler(CommandHandler("start", start))

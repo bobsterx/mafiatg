@@ -345,9 +345,14 @@ async def process_bot_actions(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             
             await asyncio.sleep(random.uniform(1, 3))  # Імітація "думання"
             
+            # Загальне повідомлення
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=random.choice(BOT_NIGHT_MESSAGES),
+                parse_mode=ParseMode.HTML
+            )
+            
+            # Специфічне повідомлення для дії
             message_options = BOT_ACTION_MESSAGES.get(action)
             if message_options:
                 info_text = random.choice(message_options)
@@ -359,6 +364,42 @@ async def process_bot_actions(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 text=info_text,
                 parse_mode=ParseMode.HTML
             )
+
+    # Боти також можуть кидати картоплю під час події "Буковель"
+    if game.get('special_event') == 'bukovel':
+        all_players = mafia_game.get_all_players(chat_id)
+
+        for bot_id, bot_info in game['bots'].items():
+            if not bot_info['alive']:
+                continue
+
+            if mafia_game.get_player_item(chat_id, bot_id) != 'potato':
+                continue
+
+            if bot_id in game['potato_throws']:
+                continue
+
+            # 50% шанс що бот кине картоплю
+            if random.random() >= 0.5:
+                continue
+
+            alive_targets = [
+                uid for uid, pinfo in all_players.items()
+                if pinfo['alive'] and uid != bot_id
+            ]
+
+            if not alive_targets:
+                continue
+
+            target = random.choice(alive_targets)
+
+            if mafia_game.use_potato(chat_id, bot_id, target):
+                target_name = all_players[target]['username']
+                
+                # Використовуємо функцію для анонімного повідомлення
+                await _announce_hidden_potato_throw(
+                    context, chat_id, target_name
+                )
 
     # Боти також можуть кидати картоплю під час події "Буковель"
     if game.get('special_event') == 'bukovel':
@@ -1114,16 +1155,16 @@ async def night_phase(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     )
 
     # Таймер
-    job_queue = _get_job_queue(context)
-    if job_queue:
-        job_queue.run_once(
-            night_timeout,
-            when=night_duration,
-            chat_id=chat_id,
-            name=f"night_{chat_id}"
-        )
-    else:
-        await _notify_missing_scheduler(context, chat_id, game)
+  job_queue = _get_job_queue(context)
+if job_queue:
+    job_queue.run_once(
+        discussion_timeout,
+        when=discussion_duration,
+        chat_id=chat_id,
+        name=f"discussion_{chat_id}"
+    )
+else:
+    await _notify_missing_scheduler(context, chat_id, game)
     context.job_queue.run_once(
         night_timeout,
         when=night_duration,
@@ -1664,7 +1705,7 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> ({discussion_duration} сек)
 
-{random.choice(DISCUSSION_PHРАSES)}
+{random.choice(DISCUSSION_PHRASES)}
 """
     elif saved:
         saved_name = all_players[healed_target]['username']
@@ -1709,22 +1750,17 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     # Обговорення (таймер з конфігурації)
     game['phase'] = 'discussion'
     game['discussion_started'] = True
-    job_queue = _get_job_queue(context)
-    if job_queue:
-        job_queue.run_once(
-            discussion_timeout,
-            when=discussion_duration,
-            chat_id=chat_id,
-            name=f"discussion_{chat_id}"
-        )
-    else:
-        await _notify_missing_scheduler(context, chat_id, game)
-    context.job_queue.run_once(
-        discussion_timeout,
-        when=discussion_duration,
+   # Таймер
+job_queue = _get_job_queue(context)
+if job_queue:
+    job_queue.run_once(
+        night_timeout,
+        when=night_duration,
         chat_id=chat_id,
-        name=f"discussion_{chat_id}"
+        name=f"night_{chat_id}"
     )
+else:
+    await _notify_missing_scheduler(context, chat_id, game)
 
 
 async def discussion_timeout(context: ContextTypes.DEFAULT_TYPE):
