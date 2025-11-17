@@ -49,6 +49,68 @@ for gif_type, gif_path in GIF_PATHS.items():
         logger.warning(f"⚠️ GIF не знайдено: {gif_type} -> {gif_path}")
 
 
+_JOB_QUEUE_WARNED = False
+
+
+BOT_ACTION_MESSAGES = {
+    'kill': [
+        "🔫 Мафія зробила свій вибір...",
+        "🌙 Мафія обирає жертву...",
+        "😈 Темна справа у розпалі..."
+    ],
+    'heal': [
+        "💉 Лікар зробив свій вибір...",
+        "🏥 Федорчак уже працює...",
+        "⚕️ Швидка допомога на місці..."
+    ],
+    'check': [
+        "🔍 Детектив шукає правду...",
+        "🕵️ Детектив проводить розслідування...",
+        "🔦 Хтось шукає відповіді..."
+    ],
+    'shoot': [
+        "💥 Детектив готує зброю...",
+        "⚡ Наближається постріл справедливості...",
+        "🔫 Справедливість незабаром восторжествує..."
+    ]
+}
+
+
+# ============================================
+# ДОПОМІЖНІ ФУНКЦІЇ
+# ============================================
+
+def _get_job_queue(context: ContextTypes.DEFAULT_TYPE):
+    """Повертає JobQueue або логувує підказку щодо встановлення залежності."""
+    global _JOB_QUEUE_WARNED
+    job_queue = getattr(context, "job_queue", None)
+    if job_queue is None and not _JOB_QUEUE_WARNED:
+        logger.error(
+            "⏱️ JobQueue недоступний. Встановіть додаткову залежність: "
+            'pip install "python-telegram-bot[job-queue]"'
+        )
+        _JOB_QUEUE_WARNED = True
+    return job_queue
+
+
+async def _notify_missing_scheduler(context: ContextTypes.DEFAULT_TYPE, chat_id: int, game: dict):
+    """Попереджає чат про відсутність таймерів (показує лише один раз)."""
+    if game.get('job_queue_missing_notified'):
+        return
+
+    game['job_queue_missing_notified'] = True
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "⚠️ <b>Автоматичні таймери недоступні.</b>\n\n"
+            "Встановіть залежність <code>python-telegram-bot[job-queue]</code>,\n"
+            "щоб нічні та денні фази завершувались автоматично."
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+
 # ============================================
 # ДОПОМІЖНІ ФУНКЦІЇ
 # ============================================
@@ -62,6 +124,8 @@ def _merge_players(game: dict) -> dict:
 
 def _cancel_jobs(job_queue, name: str):
     """Видаляє всі задачі з певною назвою, щоб уникнути подвійного виконання"""
+    if job_queue is None:
+        return
     for job in job_queue.get_jobs_by_name(name):
         job.schedule_removal()
 
@@ -260,11 +324,15 @@ async def process_bot_actions(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             
             await asyncio.sleep(random.uniform(1, 3))  # Імітація "думання"
             
-            bot_name = bot_info['username']
-            action_emoji = {'kill': '🔪', 'heal': '💉'}
+            message_options = BOT_ACTION_MESSAGES.get(action)
+            if message_options:
+                info_text = random.choice(message_options)
+            else:
+                info_text = "🤖 Бот завершив свій хід..."
+
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"🤖 <b>{bot_name}</b> {action_emoji.get(action, '✅')} зробив свій вибір...",
+                text=info_text,
                 parse_mode=ParseMode.HTML
             )
 
@@ -301,6 +369,7 @@ async def process_bot_actions(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
                 await context.bot.send_message(
                     chat_id=chat_id,
+                    text=f"🤖🥔 Один із ботів кинув картоплю в <b>{target_name}</b>!",
                     text=f"🤖🥔 <b>{bot_name}</b> кинув картоплю в <b>{target_name}</b>!",
                     parse_mode=ParseMode.HTML
                 )
@@ -309,7 +378,7 @@ async def process_bot_actions(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 async def process_bot_votes(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """Обробка голосів ботів за висунення кандидата"""
     game = mafia_game.games[chat_id]
-    
+
     for bot_id, bot_info in game['bots'].items():
         if not bot_info['alive']:
             continue
@@ -326,11 +395,13 @@ async def process_bot_votes(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             parse_mode=ParseMode.HTML
         )
 
+    await check_nominations_complete(context, chat_id)
+
 
 async def process_bot_final_votes(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """Боти голосують ЗА/ПРОТИ випадково"""
     game = mafia_game.games[chat_id]
-    
+
     for bot_id, bot_info in game['bots'].items():
         if not bot_info['alive']:
             continue
@@ -340,12 +411,13 @@ async def process_bot_final_votes(context: ContextTypes.DEFAULT_TYPE, chat_id: i
         vote = random.choice(['yes', 'no'])
         game['vote_results'][bot_id] = vote
         
-        bot_name = bot_info['username']
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"🤖 <b>{bot_name}</b> проголосував!",
+            text="🤖 Один із ботів проголосував!",
             parse_mode=ParseMode.HTML
         )
+
+    await check_final_voting_complete(context, chat_id)
 
 
 # ============================================
@@ -1014,6 +1086,16 @@ async def night_phase(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     )
 
     # Таймер
+    job_queue = _get_job_queue(context)
+    if job_queue:
+        job_queue.run_once(
+            night_timeout,
+            when=night_duration,
+            chat_id=chat_id,
+            name=f"night_{chat_id}"
+        )
+    else:
+        await _notify_missing_scheduler(context, chat_id, game)
     context.job_queue.run_once(
         night_timeout,
         when=night_duration,
@@ -1592,6 +1674,16 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     # Обговорення (таймер з конфігурації)
     game['phase'] = 'discussion'
     game['discussion_started'] = True
+    job_queue = _get_job_queue(context)
+    if job_queue:
+        job_queue.run_once(
+            discussion_timeout,
+            when=discussion_duration,
+            chat_id=chat_id,
+            name=f"discussion_{chat_id}"
+        )
+    else:
+        await _notify_missing_scheduler(context, chat_id, game)
     context.job_queue.run_once(
         discussion_timeout,
         when=discussion_duration,

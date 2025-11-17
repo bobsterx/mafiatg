@@ -151,7 +151,7 @@ class MafiaGame:
         all_players = self.get_all_players(chat_id)
         players = list(all_players.keys())
         player_count = len(players)
-        
+
         if player_count < 5:
             return False
         
@@ -165,16 +165,38 @@ class MafiaGame:
         while len(roles_to_assign) < player_count:
             roles_to_assign.append('demyan')
         
-        random.shuffle(players)
-        random.shuffle(roles_to_assign)
-        
-        # Присвоюємо ролі
-        for player_id, role in zip(players, roles_to_assign):
+        roles_pool = roles_to_assign.copy()
+
+        human_ids = list(game['players'].keys())
+        bot_ids = list(game['bots'].keys())
+        random.shuffle(human_ids)
+        random.shuffle(bot_ids)
+
+        assignments = {}
+
+        # Детектив завжди дістається живому гравцю, якщо такі є
+        if 'detective' in roles_pool and human_ids:
+            detective_owner = human_ids.pop()
+            assignments[detective_owner] = 'detective'
+            roles_pool.remove('detective')
+
+        # Решта ролей розподіляються випадково між усіма
+        remaining_players = human_ids + bot_ids
+        random.shuffle(remaining_players)
+
+        for role in roles_pool:
+            if not remaining_players:
+                break
+            player_id = remaining_players.pop()
+            assignments[player_id] = role
+
+        # Фінально зберігаємо ролі
+        for player_id, role in assignments.items():
             if player_id in game['players']:
                 game['players'][player_id]['role'] = role
             elif player_id in game['bots']:
                 game['bots'][player_id]['role'] = role
-        
+
         game['alive_players'] = set(players)
         game['started'] = True
         
@@ -184,7 +206,7 @@ class MafiaGame:
             for player_id in players:
                 if random.random() < event['item_chance']:
                     game['special_items'][player_id] = event['special_item']
-        
+
         return True
     
     def get_role_info(self, role_key: str) -> Dict:
