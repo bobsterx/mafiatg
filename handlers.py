@@ -52,6 +52,15 @@ for gif_type, gif_path in GIF_PATHS.items():
 _JOB_QUEUE_WARNED = False
 
 
+BOT_NIGHT_MESSAGES = [
+    "🤖 Нічні тіні ворушаться у темряві...",
+    "🌒 Хтось робить хід у тиші ночі...",
+    "🕯 Таємничі шепоти лунають у темряві...",
+    "🌫 У темряві чутно приглушені кроки...",
+    "😶‍🌫️ Село занурюється в напругу ночі..."
+]
+
+PERKS_DIVIDER = "━━━━━━━━━━━━━━"
 BOT_ACTION_MESSAGES = {
     'kill': [
         "🔫 Мафія зробила свій вибір...",
@@ -324,6 +333,9 @@ async def process_bot_actions(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             
             await asyncio.sleep(random.uniform(1, 3))  # Імітація "думання"
             
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=random.choice(BOT_NIGHT_MESSAGES),
             message_options = BOT_ACTION_MESSAGES.get(action)
             if message_options:
                 info_text = random.choice(message_options)
@@ -369,6 +381,7 @@ async def process_bot_actions(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
                 await context.bot.send_message(
                     chat_id=chat_id,
+                    text=f"🥔 <i>Хтось кинув картоплю в <b>{target_name}</b>!</i>",
                     text=f"🤖🥔 Один із ботів кинув картоплю в <b>{target_name}</b>!",
                     text=f"🤖🥔 <b>{bot_name}</b> кинув картоплю в <b>{target_name}</b>!",
                     parse_mode=ParseMode.HTML
@@ -1577,18 +1590,17 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
     # День
     game['phase'] = 'day'
+    morning_intro = random.choice(MORNING_PHRASES)
 
-    await send_gif(
-        context,
-        chat_id,
-        'morning',
-        f"{random.choice(MORNING_PHRASES)}\n🌅 Село прокидається..."
-    )
     await asyncio.sleep(2)
 
     perks_block = ""
     if game['perks_messages']:
-        perks_block = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" + "\n".join(game['perks_messages']) + "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        perks_block = (
+            f"\n\n{PERKS_DIVIDER}\n"
+            + "\n".join(game['perks_messages'])
+            + f"\n{PERKS_DIVIDER}"
+        )
 
     # Оголошення результатів
     if victims:
@@ -1601,6 +1613,8 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
             night_result = f"""
 ☀️ <b>━━━━━ РАНОК ДНЯ {game['day_number']} ━━━━━</b> ☀️
+
+{morning_intro}
 
 💀 <b>ТРАГІЧНА НОВИНА!</b> 💀
 
@@ -1627,13 +1641,15 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             night_result = f"""
 ☀️ <b>━━━━━ РАНОК ДНЯ {game['day_number']} ━━━━━</b> ☀️
 
+{morning_intro}
+
 💀 <b>КРИВАВА НІЧ!</b> 💀
 
 {victims_block}{perks_block}
 
 🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> ({discussion_duration} сек)
 
-{random.choice(DISCUSSION_PHRASES)}
+{random.choice(DISCUSSION_PHРАSES)}
 """
     elif saved:
         saved_name = all_players[healed_target]['username']
@@ -1641,6 +1657,8 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
         night_result = f"""
 ☀️ <b>━━━━━ РАНОК ДНЯ {game['day_number']} ━━━━━</b> ☀️
+
+{morning_intro}
 
 🎉 <b>ДИВО!</b> 🎉
 
@@ -1650,11 +1668,13 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> ({discussion_duration} сек)
 
-{random.choice(DISCUSSION_PHRASES)}
+{random.choice(DISCUSSION_PHРАSES)}
 """
     else:
         night_result = f"""
 ☀️ <b>━━━━━ РАНОК ДНЯ {game['day_number']} ━━━━━</b> ☀️
+
+{morning_intro}
 
 😌 <b>СПОКІЙНА НІЧ!</b> 😌
 
@@ -1662,7 +1682,7 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> ({discussion_duration} сек)
 
-{random.choice(DISCUSSION_PHRASES)}
+{random.choice(DISCUSSION_PHРАSES)}
 """
 
     await send_gif(context, chat_id, 'death' if victims else 'morning', night_result)
@@ -1706,6 +1726,22 @@ async def discussion_timeout(context: ContextTypes.DEFAULT_TYPE):
     )
     await asyncio.sleep(1)
     await start_voting(context, chat_id)
+
+
+async def final_voting_timeout(context: ContextTypes.DEFAULT_TYPE):
+    """Автоматичне завершення фінального голосування"""
+    chat_id = context.job.chat_id
+    game = mafia_game.games.get(chat_id)
+    if not game or game.get('final_voting_done'):
+        return
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="⏰ <b>Час фінального голосування вичерпано!</b>\n\nПідраховуємо наявні голоси...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    await process_final_voting(context, chat_id)
 
 
 # ============================================
@@ -1956,7 +1992,17 @@ async def start_final_voting(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
              f"🪢 Доля гравця у ваших руках!",
         parse_mode=ParseMode.HTML
     )
-    
+
+    job_queue = _get_job_queue(context)
+    if job_queue:
+        _cancel_jobs(job_queue, f"final_vote_{chat_id}")
+        job_queue.run_once(
+            final_voting_timeout,
+            when=TIMERS['final_vote'],
+            chat_id=chat_id,
+            name=f"final_vote_{chat_id}"
+        )
+
     # Боти голосують
     await asyncio.sleep(random.uniform(2, 4))
     await process_bot_final_votes(context, chat_id)
@@ -1976,6 +2022,8 @@ async def check_final_voting_complete(context: ContextTypes.DEFAULT_TYPE, chat_i
 async def process_final_voting(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """Обробка фінального голосування"""
     game = mafia_game.games[chat_id]
+
+    _cancel_jobs(getattr(context, 'job_queue', None), f"final_vote_{chat_id}")
 
     if game.get('final_voting_done'):
         return
