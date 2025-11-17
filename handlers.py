@@ -2,8 +2,8 @@
 
 Повний функціонал:
 - Реєстрація гравців та ботів
-- Нічна фаза з таймером (45 сек)
-- Денна фаза з обговоренням (60 сек)
+- Нічна фаза з таймером (налаштовується)
+- Денна фаза з обговоренням (налаштовується)
 - Голосування за виключення
 - Логіка ботів (мафія/лікар/мирні)
 - Спеціальні події (Буковель + картопля)
@@ -29,9 +29,9 @@ import random
 from typing import Optional, List, Tuple
 
 from config import (
-    ROLES, DEATH_PHRASES, SAVED_PHRASES, MAFIA_PHRASES, 
+    ROLES, DEATH_PHRASES, SAVED_PHRASES, MAFIA_PHRASES,
     DISCUSSION_PHRASES, MORNING_PHRASES, NIGHT_PHRASES,
-    POTATO_PHRASES, SPECIAL_EVENTS, GIF_PATHS
+    POTATO_PHRASES, SPECIAL_EVENTS, GIF_PATHS, TIMERS
 )
 from game_state import mafia_game
 
@@ -43,10 +43,22 @@ logging.basicConfig(
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# Перевіряємо наявність GIF файлів одразу при завантаженні модуля
+for gif_type, gif_path in GIF_PATHS.items():
+    if not os.path.exists(gif_path):
+        logger.warning(f"⚠️ GIF не знайдено: {gif_type} -> {gif_path}")
+
 
 # ============================================
 # ДОПОМІЖНІ ФУНКЦІЇ
 # ============================================
+
+def _merge_players(game: dict) -> dict:
+    """Комбінує гравців та ботів у один словник"""
+    combined = dict(game['players'])
+    combined.update(game['bots'])
+    return combined
+
 
 async def send_gif(context: ContextTypes.DEFAULT_TYPE, chat_id: int, gif_type: str, caption: str = None):
     """Відправка GIF файлу"""
@@ -78,6 +90,70 @@ async def send_gif(context: ContextTypes.DEFAULT_TYPE, chat_id: int, gif_type: s
             )
 
 
+async def send_potato_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Надсилає меню кидка картоплі для власників бульби"""
+    game = mafia_game.games[chat_id]
+
+    if game.get('special_event') != 'bukovel':
+        return
+
+    all_players = mafia_game.get_all_players(chat_id)
+    alive_targets = [
+        (uid, pinfo) for uid, pinfo in all_players.items() if pinfo['alive']
+    ]
+
+    if len(alive_targets) <= 1:
+        return
+
+    event_info = SPECIAL_EVENTS['bukovel']
+
+    for user_id, player_info in game['players'].items():
+        if not player_info['alive']:
+            continue
+
+        if mafia_game.get_player_item(chat_id, user_id) != 'potato':
+            continue
+
+        if user_id in game['potato_throws']:
+            continue
+
+        keyboard = []
+        for target_id, target_info in alive_targets:
+            if target_id == user_id:
+                continue
+
+            bot_mark = "🤖 " if target_info['is_bot'] else ""
+            keyboard.append([InlineKeyboardButton(
+                f"🥔 {bot_mark}{target_info['username']}",
+                callback_data=f"potato_throw_{chat_id}_{target_id}"
+            )])
+
+        if not keyboard:
+            continue
+
+        keyboard.append([InlineKeyboardButton(
+            "🚫 Приберегти картоплю",
+            callback_data=f"potato_throw_{chat_id}_0"
+        )])
+
+        text = (
+            "🥔 <b>БУКОВЕЛЬСЬКА КАРТОПЛЯ!</b>\n\n"
+            f"{event_info['item_description']}\n"
+            "🎯 Шанс вбити: 20%\n\n"
+            "Виберіть ціль або збережіть картоплю."
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Помилка надсилання меню картоплі {user_id}: {e}")
+
+
 async def check_dead_player_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Блокує повідомлення від мертвих гравців"""
     if not update.message or not update.message.text:
@@ -105,25 +181,29 @@ async def check_dead_player_message(update: Update, context: ContextTypes.DEFAUL
 # ============================================
 
 def bot_mafia_choice(game: dict, bot_id: int) -> Optional[int]:
-    """Мафія вибирає жертву випадково з мирних"""
+    """Мафія вибирає жертву випадково з живих мирних (включно з ботами)"""
+    all_players = _merge_players(game)
     citizens = [
-        uid for uid, pinfo in game['players'].items()
-        if pinfo['alive'] and mafia_game.get_role_info(pinfo['role'])['team'] == 'citizens'
+        uid for uid, pinfo in all_players.items()
+        if pinfo['alive']
+        and uid != bot_id
+        and mafia_game.get_role_info(pinfo['role'])['team'] == 'citizens'
     ]
     return random.choice(citizens) if citizens else None
 
 
 def bot_doctor_choice(game: dict, bot_id: int) -> Optional[int]:
-    """Лікар лікує випадково (не себе двічі поспіль)"""
+    """Лікар лікує випадково (враховуючи всіх живих) і не себе двічі поспіль"""
+    all_players = _merge_players(game)
     targets = [
-        uid for uid, pinfo in game['players'].items()
+        uid for uid, pinfo in all_players.items()
         if pinfo['alive'] and (uid != bot_id or game['last_healed'] != bot_id)
     ]
     return random.choice(targets) if targets else None
 
 
 def bot_voting_choice(game: dict, bot_id: int) -> int:
-    """Бот голосує за гравця з 2+ голосами або за випадкового"""
+    """Бот голосує за гравця з 2+ голосами або за випадкового живого"""
     # Підраховуємо голоси
     vote_counts = defaultdict(int)
     for voted_for in game['votes'].values():
@@ -136,8 +216,9 @@ def bot_voting_choice(game: dict, bot_id: int) -> int:
         return random.choice(candidates)
     
     # Інакше випадковий живий гравець (крім себе)
+    all_players = _merge_players(game)
     alive = [
-        uid for uid, pinfo in game['players'].items()
+        uid for uid, pinfo in all_players.items()
         if pinfo['alive'] and uid != bot_id
     ]
     return random.choice(alive) if alive else 0
@@ -180,6 +261,43 @@ async def process_bot_actions(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 text=f"🤖 <b>{bot_name}</b> {action_emoji.get(action, '✅')} зробив свій вибір...",
                 parse_mode=ParseMode.HTML
             )
+
+    # Боти також можуть кидати картоплю під час події "Буковель"
+    if game.get('special_event') == 'bukovel':
+        all_players = mafia_game.get_all_players(chat_id)
+
+        for bot_id, bot_info in game['bots'].items():
+            if not bot_info['alive']:
+                continue
+
+            if mafia_game.get_player_item(chat_id, bot_id) != 'potato':
+                continue
+
+            if bot_id in game['potato_throws']:
+                continue
+
+            if random.random() >= 0.5:
+                continue
+
+            alive_targets = [
+                uid for uid, pinfo in all_players.items()
+                if pinfo['alive'] and uid != bot_id
+            ]
+
+            if not alive_targets:
+                continue
+
+            target = random.choice(alive_targets)
+
+            if mafia_game.use_potato(chat_id, bot_id, target):
+                bot_name = bot_info['username']
+                target_name = all_players[target]['username']
+
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🤖🥔 <b>{bot_name}</b> кинув картоплю в <b>{target_name}</b>!",
+                    parse_mode=ParseMode.HTML
+                )
 
 
 async def process_bot_votes(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
@@ -822,7 +940,7 @@ async def start_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ============================================
 
 async def night_phase(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Нічна фаза з таймером 45 секунд"""
+    """Нічна фаза з таймером"""
     if chat_id not in mafia_game.games:
         return
 
@@ -832,8 +950,10 @@ async def night_phase(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     game['detective_shot_this_night'] = None
     game['perks_messages'] = []
     game['night_resolved'] = False
+    game['potato_throws'] = {}
 
     night_phrase = random.choice(NIGHT_PHRASES)
+    night_duration = TIMERS['night']
     
     await send_gif(
         context, 
@@ -841,12 +961,17 @@ async def night_phase(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         'night',
         f"🌙 <b>━━━ НІЧ {game['day_number']} ━━━</b> 🌙\n\n"
         f"{night_phrase}\n\n"
-        f"⏳ У вас є 45 секунд на дії...\n"
+        f"⏳ У вас є {night_duration} секунд на дії...\n"
         f"🤫 {random.choice(MAFIA_PHRASES)}"
     )
 
-    # Таймер: 45 секунд
-    context.job_queue.run_once(night_timeout, when=45, chat_id=chat_id, name=f"night_{chat_id}")
+    # Таймер
+    context.job_queue.run_once(
+        night_timeout,
+        when=night_duration,
+        chat_id=chat_id,
+        name=f"night_{chat_id}"
+    )
 
     # Розсилка дій живим гравцям
     for user_id, player_info in game['players'].items():
@@ -934,6 +1059,7 @@ async def night_phase(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
     # Боти роблять свої дії автоматично
     await asyncio.sleep(2)
+    await send_potato_menu(context, chat_id)
     await process_bot_actions(context, chat_id)
 
 
@@ -974,8 +1100,11 @@ async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     
     # Постріл детектива
     if action == 'shoot':
+        if game['detective_bullet_used']:
+            await query.edit_message_text("⚠️ Куля вже використана!", parse_mode=ParseMode.HTML)
+            return
         if data[3] == 'menu':
-            alive = [(uid, pinfo) for uid, pinfo in all_players.items() 
+            alive = [(uid, pinfo) for uid, pinfo in all_players.items()
                      if pinfo['alive'] and uid != user_id]
             
             shoot_keyboard = []
@@ -1069,6 +1198,62 @@ async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await check_night_complete(context, chat_id)
 
 
+async def potato_throw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробка кидка картоплі"""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data.split('_')
+    chat_id = int(data[2])
+    target_id = int(data[3])
+    user_id = query.from_user.id
+
+    game = mafia_game.games.get(chat_id)
+    if not game or game['phase'] != 'night':
+        await query.edit_message_text("⚠️ Нічна фаза завершилась!", parse_mode=ParseMode.HTML)
+        return
+
+    if target_id == 0:
+        await query.edit_message_text(
+            "🥔 Ви приберегли картоплю на іншу ніч.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if user_id in game['potato_throws']:
+        await query.edit_message_text(
+            "🥔 Ви вже кидали картоплю цієї ночі!",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    all_players = mafia_game.get_all_players(chat_id)
+    if target_id not in all_players or not all_players[target_id]['alive']:
+        await query.edit_message_text("⚠️ Ціль недоступна!", parse_mode=ParseMode.HTML)
+        return
+
+    success = mafia_game.use_potato(chat_id, user_id, target_id)
+    if not success:
+        await query.edit_message_text(
+            "⚠️ Ви більше не маєте картоплі!",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    target_name = all_players[target_id]['username']
+
+    await query.edit_message_text(
+        f"🥔 Ви кинули картоплю в <b>{target_name}</b>!\n\n⏳ Результат дізнаємось вранці...",
+        parse_mode=ParseMode.HTML
+    )
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="🥔 <i>Десь у темряві пролетіла картопля...</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+
 async def check_night_complete(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """Перевірка: всі зробили дії?"""
     game = mafia_game.games[chat_id]
@@ -1104,15 +1289,31 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     check_results = []
     detective_shot: Optional[int] = None
     potato_kills = []
+    discussion_duration = TIMERS['discussion']
+    potato_actions = dict(game.get('potato_throws', {}))
+    game['potato_throws'] = {}
 
     # Картопля з Буковеля
-    if game['special_event'] == 'bukovel':
-        for thrower_id, target_id in game.get('potato_throws', {}).items():
+    if game['special_event'] == 'bukovel' and potato_actions:
+        for thrower_id, target_id in potato_actions.items():
+            thrower = all_players.get(thrower_id)
+            target = all_players.get(target_id)
+
+            if not target:
+                continue
+
+            thrower_name = thrower['username'] if thrower else "Гравець"
+            target_name = target['username']
+
             if random.random() < 0.20:  # 20% влучити
                 potato_kills.append((thrower_id, target_id))
                 game['perks_messages'].append(
                     f"🥔💥 <b>{random.choice(POTATO_PHRASES)}</b>\n"
-                    f"💀 Бульба забрала життя!"
+                    f"<b>{thrower_name}</b> влучив у <b>{target_name}</b>!"
+                )
+            else:
+                game['perks_messages'].append(
+                    f"🥔 <b>{thrower_name}</b> промахнувся по <b>{target_name}</b>!"
                 )
 
     # Розбір нічних дій
@@ -1204,6 +1405,8 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 {'⚠️ Обережно з цією інформацією!' if is_mafia else '✅ Можна довіряти.'}
 """
+        if had_error:
+            result_text += "\n⚠️ <i>Здається, інтуїція цього разу підвела... (5% похибка)</i>"
         try:
             await context.bot.send_message(
                 chat_id=detective_id,
@@ -1249,7 +1452,7 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 {death_phrase}{perks_block}
 
-🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> (60 сек)
+🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> ({discussion_duration} сек)
 
 {random.choice(DISCUSSION_PHRASES)}
 """
@@ -1269,7 +1472,7 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 {victims_block}{perks_block}
 
-🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> (60 сек)
+🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> ({discussion_duration} сек)
 
 {random.choice(DISCUSSION_PHRASES)}
 """
@@ -1286,7 +1489,7 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 {saved_phrase}{perks_block}
 
-🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> (60 сек)
+🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> ({discussion_duration} сек)
 
 {random.choice(DISCUSSION_PHRASES)}
 """
@@ -1298,7 +1501,7 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 🕊 Всі живі!{perks_block}
 
-🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> (60 сек)
+🗣 <b>ЧАС ОБГОВОРЕННЯ!</b> ({discussion_duration} сек)
 
 {random.choice(DISCUSSION_PHRASES)}
 """
@@ -1309,10 +1512,15 @@ async def process_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     if await check_victory(context, chat_id):
         return
 
-    # Обговорення 60 секунд
+    # Обговорення (таймер з конфігурації)
     game['phase'] = 'discussion'
     game['discussion_started'] = True
-    context.job_queue.run_once(discussion_timeout, when=60, chat_id=chat_id, name=f"discussion_{chat_id}")
+    context.job_queue.run_once(
+        discussion_timeout,
+        when=discussion_duration,
+        chat_id=chat_id,
+        name=f"discussion_{chat_id}"
+    )
 
 
 async def discussion_timeout(context: ContextTypes.DEFAULT_TYPE):
@@ -1830,6 +2038,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Нічні дії
     elif query.data.startswith("night_"):
         await night_action_callback(update, context)
+    elif query.data.startswith("potato_throw_"):
+        await potato_throw_callback(update, context)
     # Голосування
     elif query.data.startswith("nominate_") or query.data.startswith("votefor_"):
         await vote_callback(update, context)
@@ -1840,7 +2050,7 @@ async def show_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    rules_text = """
+    rules_text = f"""
 📜 <b>━━━ ПРАВИЛА ГРИ ━━━</b> 📜
 
 <b>🎯 Мета:</b>
@@ -1854,7 +2064,7 @@ async def show_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 <b>☀️ ДЕНЬ:</b>
 - 📢 Результати ночі
-- 🗣 Обговорення (60 сек)
+- 🗣 Обговорення ({TIMERS['discussion']} сек)
 - 🗳 Голосування за виключення
 
 <b>⚡ ОСОБЛИВОСТІ:</b>
